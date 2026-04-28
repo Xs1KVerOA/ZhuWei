@@ -14,6 +14,7 @@ class GitHubSecurityAdvisoriesAdapter(SourceAdapter):
     category = "regular"
     schedule = "every 30 minutes"
     alert_enabled = False
+    github_evidence_auto_search = False
 
     url = "https://api.github.com/advisories"
 

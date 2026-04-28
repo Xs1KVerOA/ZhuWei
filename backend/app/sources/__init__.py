@@ -8,6 +8,12 @@ from .nvd import NvdRecentAdapter
 from .oscs import OscsIntelAdapter
 from .rss_biu import BiuProductCatalogAdapter, BiuRssAdapter
 from .seebug import SeebugVuldbAdapter
+from .stable_feeds import (
+    CxsecurityRssAdapter,
+    GitHubSecurityLabAdvisoriesAdapter,
+    GobyVulsGitHubAdapter,
+    SploitusRssAdapter,
+)
 from .struts2 import Struts2BulletinAdapter
 from .threatbook import ThreatbookVulnAdapter
 from .venustech import VenustechNoticeAdapter
@@ -26,6 +32,10 @@ ADAPTERS = [
     AvdHighRiskAdapter(),
     CnvdListAdapter(),
     DoonsecWechatRssAdapter(),
+    SploitusRssAdapter(),
+    CxsecurityRssAdapter(),
+    GobyVulsGitHubAdapter(),
+    GitHubSecurityLabAdvisoriesAdapter(),
     VenustechNoticeAdapter(),
     Struts2BulletinAdapter(),
 ]

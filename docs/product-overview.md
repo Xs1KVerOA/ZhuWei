@@ -37,6 +37,10 @@ Logo 由四个元素组成：
 - BIU 产品库
 - NVD Recent CVE
 - GitHub Security Advisories
+- GitHub Security Lab Advisories
+- GobyVuls GitHub 漏洞文档
+- Sploitus RSS POC/EXP 线索（默认关闭，可在网络可达环境手动启用）
+- CXSecurity WLB RSS POC/EXP 线索（默认关闭，可在网络可达环境手动启用）
 - GitHub POC/EXP 仓库与代码证据搜索
 - 长亭 VulDB
 - OSCS 开源安全情报
@@ -50,7 +54,7 @@ Logo 由四个元素组成：
 
 数据源分为 regular 和 slow 两组。regular 默认每 30 分钟执行一次，slow 默认每天 10:00 和 18:00 执行一次。
 
-GitHub Security Advisories 作为证据源入库，不自动触发高危告警。系统会对带 CVE/GHSA 的漏洞自动搜索 GitHub 仓库和代码命中，将疑似 POC/EXP 作为“GitHub 证据”写入 POC/EXP Tab，并用本地规则给出可信度评分。
+GitHub Security Advisories、GitHub Security Lab、GobyVuls、Sploitus 和 CXSecurity 作为证据源入库，不自动触发高危告警。系统会对带 CVE/GHSA 的漏洞自动搜索 GitHub 仓库和代码命中，将疑似 POC/EXP 作为“GitHub 证据”写入 POC/EXP Tab，并用本地规则给出可信度评分。
 
 ### 产品库与关注资产
 

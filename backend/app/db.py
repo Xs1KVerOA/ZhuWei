@@ -2933,6 +2933,9 @@ def _direct_product_matches(
         ):
             matches[product_key_value] = payload
 
+    if product:
+        add(product, "source_product_field", 0.9, f"源产品字段：{product}")
+
     for label in labels:
         normalized = _normalize_product_text(label)
         if not normalized:
@@ -3169,6 +3172,7 @@ NOISY_PRODUCT_NORMALIZED = {
     "impropercontroloffilename",
     "multipleproducts",
     "author",
+    "by",
     "director",
     "versions",
     "authorizationbypass",
@@ -3182,6 +3186,7 @@ NOISY_PRODUCT_NORMALIZED = {
     "systemsThisvulnerabilitycouldaffect",
     "functionr7webssecurityhandlerfunction",
     "functionupdatestoryboardurl",
+    "arbitrarycodeexecution",
 }
 
 
@@ -3211,6 +3216,7 @@ NOISY_PRODUCT_PREFIXES = [
     "the affected element",
     "the affected function",
     "function ",
+    "ghsl-",
     "systems. this vulnerability",
 ]
 
@@ -3339,7 +3345,7 @@ def _product_labels_from_text(value: str) -> list[str]:
         r"\bin\s+([A-Za-z0-9][A-Za-z0-9_.:/-]+(?:\s+[A-Za-z0-9][A-Za-z0-9_.:/()-]+){0,5})[,.]\s+(?:this|the|affected|executing)",
         r"\bin\s+([A-Z][A-Za-z0-9_.-]+(?:\s+[A-Z0-9][A-Za-z0-9_.-]+){0,4})(?:\s+(?:up to|before|through|prior to|versions?|version|\d))",
         r"\b(?:detected|identified|discovered|found)\s+in\s+([A-Z][A-Za-z0-9_.-]+(?:\s+[A-Z0-9][A-Za-z0-9_.-]+){0,4})",
-        r"\b(?:affects|affected)\s+(?:the\s+)?([A-Z][A-Za-z0-9_.-]+(?:\s+[A-Z0-9][A-Za-z0-9_.-]+){0,4})",
+        r"\baffects\s+(?:the\s+)?([A-Z][A-Za-z0-9_.-]+(?:\s+[A-Z0-9][A-Za-z0-9_.-]+){0,4})",
     ]:
         match = re.search(pattern, text, flags=re.I)
         if match:

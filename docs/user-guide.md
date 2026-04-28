@@ -142,7 +142,7 @@ AVD、CNVD 等站点可能需要真实浏览器会话。站点会话区提供：
 
 可以手动运行单个源，也可以通过顶部按钮运行 regular 或 slow 源组。
 
-GitHub Security Advisories 会作为 regular 源入库，但默认不产生高危告警。带 CVE/GHSA 的漏洞会在后台按预算自动搜索 GitHub 仓库和代码证据，并将命中的 POC/EXP 写入分析中心的 POC/EXP Tab。
+GitHub Security Advisories、GitHub Security Lab 和 GobyVuls 会作为 regular 源入库，但默认不产生高危告警。Sploitus 与 CXSecurity 已接入为可选 POC/EXP RSS 线索源，默认关闭，可在网络可达环境手动启用。带 CVE/GHSA 的漏洞会在后台按预算自动搜索 GitHub 仓库和代码证据，并将命中的 POC/EXP 写入分析中心的 POC/EXP Tab。
 
 相关接口：
 

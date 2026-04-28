@@ -37,9 +37,9 @@ ZhuWei is a localized vulnerability intelligence platform for vulnerability moni
 
 ### 中文
 
-- 多源漏洞情报采集：CISA KEV、NVD、GitHub Security Advisories、GitHub 仓库/代码证据搜索、biu.life、长亭 VulDB、OSCS、微步、Seebug、AVD、CNVD、启明星辰、Struts2 官方公告、Doonsec 微信 RSS 等。
+- 多源漏洞情报采集：CISA KEV、NVD、GitHub Security Advisories、GitHub Security Lab、GobyVuls、Sploitus、CXSecurity、GitHub 仓库/代码证据搜索、biu.life、长亭 VulDB、OSCS、微步、Seebug、AVD、CNVD、启明星辰、Struts2 官方公告、Doonsec 微信 RSS 等。
 - 数据源健康中心：记录最近成功/失败时间、平均耗时、错误类型、连续失败次数和入库趋势。
-- 告警中心：按严重等级、关键词、时间窗口和去重策略筛选高价值漏洞；Doonsec WeChat RSS 与 GitHub Advisory 当前只入库和沉淀证据，不自动触发高危告警。
+- 告警中心：按严重等级、关键词、时间窗口和去重策略筛选高价值漏洞；Doonsec WeChat RSS、GitHub Advisory 与新增稳定证据源当前只入库和沉淀证据，不自动触发高危告警。
 - GitHub 证据：对每条带 CVE/GHSA 的漏洞自动搜索 GitHub POC/EXP 仓库与代码结果，写入 POC/EXP Tab，并展示“GitHub 证据”标签和可信度评分。
 - 产品库：支持产品归属、产品别名、厂商字典、产品合并、产品详情页和产品-漏洞关系对齐。
 - 漏洞分析：支持标准分析、重新分析、红队增强分析、人工选择 Flash/Pro 模型、分析置信度、来源可信度、用户反馈和分析日志查看。
@@ -52,9 +52,9 @@ ZhuWei is a localized vulnerability intelligence platform for vulnerability moni
 
 ### English
 
-- Multi-source vulnerability ingestion: CISA KEV, NVD, GitHub Security Advisories, GitHub repository/code evidence search, biu.life, Chaitin VulDB, OSCS, ThreatBook, Seebug, Alibaba AVD, CNVD, Venustech, Apache Struts2 bulletins, Doonsec WeChat RSS, and more.
+- Multi-source vulnerability ingestion: CISA KEV, NVD, GitHub Security Advisories, GitHub Security Lab, GobyVuls, Sploitus, CXSecurity, GitHub repository/code evidence search, biu.life, Chaitin VulDB, OSCS, ThreatBook, Seebug, Alibaba AVD, CNVD, Venustech, Apache Struts2 bulletins, Doonsec WeChat RSS, and more.
 - Source health center: tracks last success/failure time, average duration, error categories, consecutive failures, and ingestion trends.
-- Alert center: filters high-value vulnerabilities by severity, keywords, time window, and deduplication rules. Doonsec WeChat RSS and GitHub Advisories are currently ingested for storage/evidence only and do not create high-risk alerts automatically.
+- Alert center: filters high-value vulnerabilities by severity, keywords, time window, and deduplication rules. Doonsec WeChat RSS, GitHub Advisories, and the added stable evidence sources are currently ingested for storage/evidence only and do not create high-risk alerts automatically.
 - GitHub evidence: automatically searches GitHub POC/EXP repositories and code results for CVE/GHSA vulnerabilities, writes them into the POC/EXP tabs, and displays a GitHub evidence label with confidence scoring.
 - Product catalog: supports product attribution, aliases, vendor dictionaries, product merging, product detail pages, and product-vulnerability relationship alignment.
 - Vulnerability analysis: supports standard analysis, re-analysis, red-team enhanced analysis, manual Flash/Pro model selection, confidence labels, source credibility, feedback, and detailed logs.
@@ -284,6 +284,10 @@ API keys should stay in local `.env` or database settings. Do not commit or pack
 - `biu_products`: biu.life 产品库 / product catalog
 - `doonsec_wechat`: Doonsec WeChat RSS, 入库但不告警 / ingested but excluded from alerts
 - `github_advisories`: GitHub Security Advisories, 入库并沉淀 GitHub 证据但不告警 / ingested as GitHub evidence and excluded from alerts
+- `github_security_lab`: GitHub Security Lab Advisories, 高可信公告证据源且不告警 / high-confidence advisory evidence and excluded from alerts
+- `goby_vuls_github`: GobyVuls GitHub, 漏洞文档证据源且不告警 / vulnerability document evidence and excluded from alerts
+- `sploitus_rss`: Sploitus RSS, POC/EXP 证据源且不告警，默认关闭 / POC/EXP evidence, excluded from alerts, disabled by default
+- `cxsecurity_wlb_rss`: CXSecurity WLB RSS, POC/EXP 证据源且不告警，默认关闭 / POC/EXP evidence, excluded from alerts, disabled by default
 - `nvd_recent`: NVD Recent CVE
 - `chaitin_vuldb`: Chaitin VulDB
 - `oscs_intel`: OSCS Open Source Intel
@@ -306,9 +310,9 @@ API keys should stay in local `.env` or database settings. Do not commit or pack
 - CVE 去重 / CVE deduplication: enabled
 - 黑白名单关键词 / keyword allowlist and blocklist: configurable
 
-Doonsec WeChat RSS 当前被视为低质量源：只进入漏洞库和产品对齐，不进入告警处理。GitHub Security Advisories 用于补充官方 GHSA/CVE 证据，也不直接创建高危告警；GitHub 仓库/代码搜索结果会以“GitHub 证据”形式进入 POC/EXP Tab。
+Doonsec WeChat RSS 当前被视为低质量源：只进入漏洞库和产品对齐，不进入告警处理。GitHub Security Advisories、GitHub Security Lab、GobyVuls、Sploitus 和 CXSecurity 用于补充公告、漏洞文档与 POC/EXP 证据，也不直接创建高危告警；GitHub 仓库/代码搜索结果会以“GitHub 证据”形式进入 POC/EXP Tab。
 
-Doonsec WeChat RSS is currently treated as a low-confidence source: it is stored and aligned to products, but does not create alerts. GitHub Security Advisories enrich GHSA/CVE evidence without creating high-risk alerts directly; GitHub repository/code results are stored as GitHub evidence in the POC/EXP tabs.
+Doonsec WeChat RSS is currently treated as a low-confidence source: it is stored and aligned to products, but does not create alerts. GitHub Security Advisories, GitHub Security Lab, GobyVuls, Sploitus, and CXSecurity enrich advisory, vulnerability-document, and POC/EXP evidence without creating high-risk alerts directly; GitHub repository/code results are stored as GitHub evidence in the POC/EXP tabs.
 
 ## 模型分析 / Model-Assisted Analysis
 

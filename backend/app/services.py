@@ -66,10 +66,12 @@ class SourceService:
 
             items = await enrich_items(items)
             count = await run_blocking(db.upsert_vulnerabilities, items)
-            github_evidence = await enrich_items_with_github_evidence(items) if items else {
+            should_refresh_github_evidence = bool(getattr(adapter, "github_evidence_auto_search", True))
+            github_evidence = await enrich_items_with_github_evidence(items) if items and should_refresh_github_evidence else {
                 "checked": 0,
                 "changed": 0,
                 "warning": "",
+                "skipped": bool(items) and not should_refresh_github_evidence,
             }
             product_alignment = await run_blocking(resolve_products_direct, items)
             alert_enabled = bool(getattr(adapter, "alert_enabled", True))
@@ -80,11 +82,10 @@ class SourceService:
             total_count = count + product_count
             source_warning = str(getattr(adapter, "last_warning", "") or "")
             github_warning = str(github_evidence.get("warning") or "")
-            if github_warning:
-                source_warning = f"{source_warning}\n{github_warning}".strip()
             status = "partial" if source_warning else "success"
             await run_blocking(db.finish_run, run_id, name, status, total_count, source_warning)
-            if force or alert_count or analysis_count or product_count or source_warning:
+            if force or alert_count or analysis_count or product_count or source_warning or github_warning:
+                github_warning_text = f"{chr(10)}GitHub 证据刷新提示：{github_warning}" if github_warning else ""
                 await run_blocking(
                     db.create_message,
                     level="warning" if source_warning else "success",
@@ -98,6 +99,7 @@ class SourceService:
                         f"产品归属 {product_alignment.get('linked', 0)} 条，"
                         f"GitHub 证据刷新 {github_evidence.get('checked', 0)} 条。"
                         f"{chr(10) + source_warning if source_warning else ''}"
+                        f"{github_warning_text}"
                     ),
                     entity_type="source",
                     entity_id=name,
@@ -112,6 +114,7 @@ class SourceService:
                         "analysis_count": analysis_count,
                         "github_evidence": github_evidence,
                         "warning": source_warning,
+                        "github_warning": github_warning,
                     },
                 )
             return {
