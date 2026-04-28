@@ -477,6 +477,31 @@ function bindAnalysisLogButtons() {
   });
 }
 
+function bindGitHubEvidenceButtons() {
+  document.querySelectorAll("[data-github-refresh-id]").forEach((button) => {
+    if (button.dataset.bound) return;
+    button.dataset.bound = "1";
+    button.addEventListener("click", async () => {
+      const id = button.dataset.githubRefreshId;
+      if (!id) return;
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = "刷新中";
+      try {
+        await api(`/api/vulnerabilities/${encodeURIComponent(id)}/github-evidence/refresh`, {
+          method: "POST",
+        });
+        await Promise.all([loadAnalysis(), loadVulns(), loadAlerts()]);
+      } catch (error) {
+        showModal("GitHub 证据刷新失败", error.message);
+      } finally {
+        button.disabled = false;
+        button.textContent = originalText;
+      }
+    });
+  });
+}
+
 function scheduleAnalysisRefresh(delay = 5000) {
   if (analysisRefreshTimer) return;
   analysisRefreshTimer = setTimeout(async () => {
@@ -601,9 +626,10 @@ function intelActions(item) {
   const cvssButton = `<button type="button" class="intel-button ${hasCvss ? "active" : ""}" ${hasCvss ? `data-intel-detail="${esc(cvssKey)}"` : "disabled"}>${esc(cvssLabel)}</button>`;
   const pocButton = artifactButton(item, "poc", "POC");
   const expButton = artifactButton(item, "exp", "EXP");
+  const githubButton = githubEvidenceButton(item);
   const reportButton = analysisReportButton(item);
   const sourceError = analysisSourceLabelAndError(item);
-  return `<div class="intel-actions">${cvssButton}${pocButton}${expButton}${reportButton}${sourceError}</div>`;
+  return `<div class="intel-actions">${cvssButton}${pocButton}${expButton}${githubButton}${reportButton}${sourceError}</div>`;
 }
 
 function artifactButton(item, kind, label) {
@@ -619,6 +645,95 @@ function artifactButton(item, kind, label) {
     body: [content, url ? `\n链接：${url}` : ""].filter(Boolean).join("\n"),
   });
   return `<button type="button" class="intel-button active ${kind}" data-intel-detail="${esc(key)}">${label}</button>`;
+}
+
+function githubEvidenceSummary(item) {
+  return item.github_evidence_summary || {};
+}
+
+function githubEvidenceItems(item, kind = "") {
+  const evidence = Array.isArray(item.github_evidence) ? item.github_evidence : [];
+  if (!kind) return evidence;
+  return evidence.filter((entry) => {
+    const artifact = String(entry.artifact_kind || "").toLowerCase();
+    if (kind === "poc") return artifact === "poc";
+    if (kind === "exp") return artifact === "exp";
+    return artifact === kind;
+  });
+}
+
+function githubEvidenceLabel(item) {
+  const summary = githubEvidenceSummary(item);
+  const count = Number(item.github_evidence_count || summary.total || 0);
+  if (!count) return "GitHub -";
+  const score = item.github_evidence_max_score ?? summary.max_score;
+  const scoreText = score === null || score === undefined ? "-" : `${Math.round(Number(score || 0))}`;
+  return `GitHub ${count} · ${scoreText}`;
+}
+
+function githubEvidenceButton(item) {
+  const count = Number(item.github_evidence_count || 0);
+  if (!count) {
+    return `<button type="button" class="intel-button" disabled>GitHub -</button>`;
+  }
+  const key = detailKey(item, "github-evidence");
+  intelDetails.set(key, {
+    title: `${item.cve_id || item.title || "漏洞"} · GitHub 证据`,
+    html: githubEvidenceListHtml(githubEvidenceItems(item)),
+  });
+  return `<button type="button" class="intel-button active github" data-intel-detail="${esc(key)}">${esc(githubEvidenceLabel(item))}</button>`;
+}
+
+function githubEvidencePill(item) {
+  const count = Number(item.github_evidence_count || 0);
+  if (!count) return "";
+  const summary = githubEvidenceSummary(item);
+  const score = item.github_evidence_max_score ?? summary.max_score ?? 0;
+  const confidence = summary.confidence || (score >= 78 ? "high" : score >= 55 ? "medium" : "low");
+  const label = confidence === "high" ? "高" : confidence === "medium" ? "中" : "低";
+  return `<span class="github-evidence-pill">GitHub 证据 ${esc(String(count))} · 可信度 ${esc(label)} ${esc(String(Math.round(Number(score || 0))))}</span>`;
+}
+
+function githubEvidenceListHtml(evidence) {
+  if (!evidence.length) return `<div class="empty inline">暂无 GitHub 证据</div>`;
+  return `
+    <div class="github-evidence-list">
+      ${evidence.map((entry) => {
+        const title = entry.title || entry.repository || entry.evidence_url || "GitHub 证据";
+        const href = entry.evidence_url || entry.url || "";
+        const confidence = entry.confidence === "high" ? "高" : entry.confidence === "medium" ? "中" : "低";
+        const meta = [
+          entry.artifact_kind || "unknown",
+          entry.evidence_type || "",
+          entry.repository || "",
+          entry.evidence_path || "",
+        ].filter(Boolean).join(" · ");
+        return `
+          <article class="github-evidence-card">
+            <div>
+              <strong>${href ? `<a href="${esc(href)}" target="_blank" rel="noreferrer">${esc(title)}</a>` : esc(title)}</strong>
+              <small>${esc(meta)}</small>
+            </div>
+            <span>可信度 ${esc(confidence)} · ${esc(String(Math.round(Number(entry.score || 0))))}</span>
+            ${entry.snippet ? `<p>${esc(textPreview(entry.snippet, 260))}</p>` : ""}
+          </article>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function githubEvidencePanel(item, kind) {
+  const evidence = githubEvidenceItems(item, kind);
+  return `
+    <div class="github-evidence-panel">
+      <div class="analysis-panel-tools">
+        <span>${esc(kind.toUpperCase())} GitHub 证据</span>
+        <button type="button" class="intel-button github" data-github-refresh-id="${esc(item.id || "")}">刷新 GitHub 证据</button>
+      </div>
+      ${githubEvidenceListHtml(evidence)}
+    </div>
+  `;
 }
 
 function analysisReportButton(item) {
@@ -2494,6 +2609,7 @@ function analysisTabs(item) {
       <span>来源可信度 ${esc(credibility.label || "-")} · ${Math.round(Number(credibility.score || 0) * 100)}%</span>
       <span>模型 ${esc(modelLabel)}</span>
       ${analysisSourcePill(item, "源码状态 ")}
+      ${githubEvidencePill(item)}
     </div>
     <div class="analysis-tabs">
       <div class="analysis-tab-buttons">
@@ -2511,11 +2627,13 @@ function analysisTabs(item) {
         <div class="analysis-panel-tools">${logButton}</div>
         <pre>${esc(analysisText(item.poc_content || output.poc_content || output.poc, item.poc_available ? "标记存在 POC，但暂无正文。" : "暂无 POC"))}</pre>
         ${item.poc_url ? `<a href="${esc(item.poc_url)}" target="_blank" rel="noreferrer">打开 POC 链接</a>` : ""}
+        ${githubEvidencePanel(item, "poc")}
       </section>
       <section data-analysis-panel="exp" hidden>
         <div class="analysis-panel-tools">${logButton}</div>
         <pre>${esc(analysisText(item.exp_content || output.exp_content || output.exp, item.exp_available ? "标记存在 EXP，但暂无正文。" : "暂无 EXP"))}</pre>
         ${item.exp_url ? `<a href="${esc(item.exp_url)}" target="_blank" rel="noreferrer">打开 EXP 链接</a>` : ""}
+        ${githubEvidencePanel(item, "exp")}
       </section>
       <section data-analysis-panel="fix" hidden>
         <div class="analysis-panel-tools">${logButton}</div>
@@ -2545,6 +2663,7 @@ function analysisCard(item, mode = "finished") {
         <span class="badge ${severityClass(item.severity)}">${esc(item.severity || "unknown")}</span>
         <span class="analysis-status ${esc(status)}">${esc(analysisStatusLabel(status))}</span>
         ${analysisSourcePill(item)}
+        ${githubEvidencePill(item)}
       </div>
       <h3>${item.url ? `<a href="${esc(item.url)}" target="_blank" rel="noreferrer">${esc(item.title)}</a>` : esc(item.title)}</h3>
       <div class="meta">${esc(analysisItemMeta(item))}</div>
@@ -2604,6 +2723,7 @@ async function loadAnalysis() {
   bindAnalysisTabButtons();
   bindAnalysisFeedbackButtons();
   bindAnalysisLogButtons();
+  bindGitHubEvidenceButtons();
   bindAnalysisButtons();
   bindAnalysisDeleteButtons();
   bindFollowButtons();
@@ -2707,6 +2827,7 @@ async function loadAlerts() {
   $("#alertNext").disabled = offset + ALERT_PAGE_LIMIT >= data.total;
   bindAckButtons();
   bindIntelButtons();
+  bindGitHubEvidenceButtons();
   bindAnalysisButtons();
   bindFollowButtons();
   watchAnalysisRefresh(data.data.map((alert) => alert.vulnerability || {}));
@@ -2736,6 +2857,7 @@ async function loadVulns() {
   $("#vulnPrev").disabled = offset <= 0;
   $("#vulnNext").disabled = offset + LIST_LIMIT >= data.total;
   bindIntelButtons();
+  bindGitHubEvidenceButtons();
   bindAnalysisButtons();
   bindFollowButtons();
   watchAnalysisRefresh(items);

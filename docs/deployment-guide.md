@@ -172,7 +172,19 @@ curl -H "X-App-Token: <token>" http://127.0.0.1:8010/api/infra/status
 
 只要 `active_database_backend` 仍为 `sqlite`，应用就还在读写 SQLite，PostgreSQL 只是迁移副本。
 
-## 7. systemd 部署示例
+## 7. GitHub 证据源配置
+
+GitHub Security Advisories 不需要 Token 即可拉取公开数据。GitHub Code Search 建议配置 `GITHUB_TOKEN`，否则系统只执行 Advisory 和仓库搜索，代码搜索会跳过。
+
+```bash
+GITHUB_TOKEN=<github-token>
+GITHUB_EVIDENCE_AUTO_SEARCH_PER_RUN=5
+GITHUB_EVIDENCE_REFRESH_HOURS=24
+```
+
+GitHub 证据只写入漏洞的证据层和 POC/EXP Tab，不会单独触发高危告警。生产环境建议按 API 配额调小 `GITHUB_EVIDENCE_AUTO_SEARCH_PER_RUN`，或在批量历史回填时临时调大。
+
+## 8. systemd 部署示例
 
 Linux 生产环境可以使用 systemd 托管。创建 `/etc/systemd/system/zhuwei.service`：
 
@@ -204,7 +216,7 @@ sudo journalctl -u zhuwei -f
 
 随机 token 会输出在 journal 日志中。
 
-## 7. Nginx 反向代理示例
+## 9. Nginx 反向代理示例
 
 如果需要通过域名访问，可以在 Nginx 中反代到本地 Uvicorn：
 
@@ -226,7 +238,7 @@ server {
 
 生产环境建议额外启用 HTTPS、访问控制或内网 VPN。
 
-## 8. 数据持久化
+## 10. 数据持久化
 
 需要持久化的目录：
 
@@ -241,7 +253,7 @@ sqlite3 backend/data/zhuwei.sqlite3 ".backup backups/zhuwei_$(date +%Y%m%d_%H%M%
 tar -czf backups/analysis_workspace_$(date +%Y%m%d_%H%M%S).tgz backend/data/analysis_workspace
 ```
 
-## 9. 升级流程
+## 11. 升级流程
 
 1. 停止服务。
 2. 备份 SQLite 数据库和分析工作目录。
@@ -263,7 +275,7 @@ sudo systemctl start zhuwei
 sudo journalctl -u zhuwei -f
 ```
 
-## 10. 安全建议
+## 12. 安全建议
 
 - 不要把服务直接暴露在公网。
 - 固定并妥善保存 `SESSION_SECRET`。
@@ -272,7 +284,7 @@ sudo journalctl -u zhuwei -f
 - 给 `backend/data/` 设置合理文件权限。
 - 生产环境用反向代理做 HTTPS 和访问来源限制。
 
-## 11. 故障排查
+## 13. 故障排查
 
 ### 登录失败
 

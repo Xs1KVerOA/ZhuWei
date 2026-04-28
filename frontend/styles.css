@@ -938,6 +938,12 @@ a.intel-button:hover {
   color: var(--red);
 }
 
+.intel-button.github {
+  border-color: #bae6fd;
+  background: #f0f9ff;
+  color: #0369a1;
+}
+
 .intel-button.analysis-report {
   border-color: #a7f3d0;
   background: #ecfdf5;
@@ -2256,6 +2262,12 @@ a.analysis-source-pill:hover {
   font-size: 12px;
 }
 
+.github-evidence-pill {
+  border-color: #bae6fd !important;
+  background: #f0f9ff !important;
+  color: #075985 !important;
+}
+
 .analysis-tabs {
   display: grid;
   gap: 8px;
@@ -2293,9 +2305,63 @@ a.analysis-source-pill:hover {
 
 .analysis-panel-tools {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 6px;
   margin-bottom: 8px;
+}
+
+.analysis-panel-tools span {
+  margin-right: auto;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.github-evidence-panel {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.github-evidence-list {
+  display: grid;
+  gap: 8px;
+}
+
+.github-evidence-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 10px;
+  border: 1px solid #dbeafe;
+  border-radius: 6px;
+  background: #fff;
+  padding: 8px;
+}
+
+.github-evidence-card strong,
+.github-evidence-card a {
+  color: #0f172a;
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.github-evidence-card a:hover {
+  color: var(--blue);
+}
+
+.github-evidence-card small,
+.github-evidence-card span {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.github-evidence-card p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #475569;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .analysis-tabs section[hidden] {

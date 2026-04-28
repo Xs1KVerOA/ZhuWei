@@ -37,9 +37,10 @@ ZhuWei is a localized vulnerability intelligence platform for vulnerability moni
 
 ### 中文
 
-- 多源漏洞情报采集：CISA KEV、NVD、biu.life、长亭 VulDB、OSCS、微步、Seebug、AVD、CNVD、启明星辰、Struts2 官方公告、Doonsec 微信 RSS 等。
+- 多源漏洞情报采集：CISA KEV、NVD、GitHub Security Advisories、GitHub 仓库/代码证据搜索、biu.life、长亭 VulDB、OSCS、微步、Seebug、AVD、CNVD、启明星辰、Struts2 官方公告、Doonsec 微信 RSS 等。
 - 数据源健康中心：记录最近成功/失败时间、平均耗时、错误类型、连续失败次数和入库趋势。
-- 告警中心：按严重等级、关键词、时间窗口和去重策略筛选高价值漏洞；Doonsec WeChat RSS 当前只入库，不进入告警处理。
+- 告警中心：按严重等级、关键词、时间窗口和去重策略筛选高价值漏洞；Doonsec WeChat RSS 与 GitHub Advisory 当前只入库和沉淀证据，不自动触发高危告警。
+- GitHub 证据：对每条带 CVE/GHSA 的漏洞自动搜索 GitHub POC/EXP 仓库与代码结果，写入 POC/EXP Tab，并展示“GitHub 证据”标签和可信度评分。
 - 产品库：支持产品归属、产品别名、厂商字典、产品合并、产品详情页和产品-漏洞关系对齐。
 - 漏洞分析：支持标准分析、重新分析、红队增强分析、人工选择 Flash/Pro 模型、分析置信度、来源可信度、用户反馈和分析日志查看。
 - 模型源切换：可在前端配置模型 URL、API Key、Flash 模型名和 Pro 模型名。
@@ -51,9 +52,10 @@ ZhuWei is a localized vulnerability intelligence platform for vulnerability moni
 
 ### English
 
-- Multi-source vulnerability ingestion: CISA KEV, NVD, biu.life, Chaitin VulDB, OSCS, ThreatBook, Seebug, Alibaba AVD, CNVD, Venustech, Apache Struts2 bulletins, Doonsec WeChat RSS, and more.
+- Multi-source vulnerability ingestion: CISA KEV, NVD, GitHub Security Advisories, GitHub repository/code evidence search, biu.life, Chaitin VulDB, OSCS, ThreatBook, Seebug, Alibaba AVD, CNVD, Venustech, Apache Struts2 bulletins, Doonsec WeChat RSS, and more.
 - Source health center: tracks last success/failure time, average duration, error categories, consecutive failures, and ingestion trends.
-- Alert center: filters high-value vulnerabilities by severity, keywords, time window, and deduplication rules. Doonsec WeChat RSS is currently ingested into the database only and does not create alerts.
+- Alert center: filters high-value vulnerabilities by severity, keywords, time window, and deduplication rules. Doonsec WeChat RSS and GitHub Advisories are currently ingested for storage/evidence only and do not create high-risk alerts automatically.
+- GitHub evidence: automatically searches GitHub POC/EXP repositories and code results for CVE/GHSA vulnerabilities, writes them into the POC/EXP tabs, and displays a GitHub evidence label with confidence scoring.
 - Product catalog: supports product attribution, aliases, vendor dictionaries, product merging, product detail pages, and product-vulnerability relationship alignment.
 - Vulnerability analysis: supports standard analysis, re-analysis, red-team enhanced analysis, manual Flash/Pro model selection, confidence labels, source credibility, feedback, and detailed logs.
 - Model source switching: configure model URL, API key, Flash model name, and Pro model name from the web console.
@@ -221,6 +223,9 @@ For mainland China networks, use the preconfigured domestic mirrors:
 | `VULN_SOURCE_RETENTION_DAYS` | 本地源码保留天数 | Source retention days |
 | `UPDATE_ENCRYPTION_KEY` | `.update` 解密密钥，支持 base64/hex/passphrase | `.update` decryption key, base64/hex/passphrase |
 | `UPDATE_REQUIRE_ENCRYPTION` | 是否强制只接受加密更新包 | whether encrypted updates are required |
+| `GITHUB_TOKEN` | GitHub API Token；未配置时只执行公开 Advisory 和仓库搜索，代码搜索会跳过 | GitHub API token; without it only public advisory/repository search runs and code search is skipped |
+| `GITHUB_EVIDENCE_AUTO_SEARCH_PER_RUN` | 每次数据源运行最多自动刷新多少条漏洞的 GitHub POC/EXP 证据 | max vulnerabilities to auto-refresh GitHub POC/EXP evidence per source run |
+| `GITHUB_EVIDENCE_REFRESH_HOURS` | 同一漏洞 GitHub 证据自动刷新间隔 | refresh interval for GitHub evidence per vulnerability |
 
 ### 模型源配置 / Model Source
 
@@ -278,6 +283,7 @@ API keys should stay in local `.env` or database settings. Do not commit or pack
 - `biu_rss`: biu.life RSS
 - `biu_products`: biu.life 产品库 / product catalog
 - `doonsec_wechat`: Doonsec WeChat RSS, 入库但不告警 / ingested but excluded from alerts
+- `github_advisories`: GitHub Security Advisories, 入库并沉淀 GitHub 证据但不告警 / ingested as GitHub evidence and excluded from alerts
 - `nvd_recent`: NVD Recent CVE
 - `chaitin_vuldb`: Chaitin VulDB
 - `oscs_intel`: OSCS Open Source Intel
@@ -300,9 +306,9 @@ API keys should stay in local `.env` or database settings. Do not commit or pack
 - CVE 去重 / CVE deduplication: enabled
 - 黑白名单关键词 / keyword allowlist and blocklist: configurable
 
-Doonsec WeChat RSS 当前被视为低质量源：只进入漏洞库和产品对齐，不进入告警处理。
+Doonsec WeChat RSS 当前被视为低质量源：只进入漏洞库和产品对齐，不进入告警处理。GitHub Security Advisories 用于补充官方 GHSA/CVE 证据，也不直接创建高危告警；GitHub 仓库/代码搜索结果会以“GitHub 证据”形式进入 POC/EXP Tab。
 
-Doonsec WeChat RSS is currently treated as a low-confidence source: it is stored and aligned to products, but does not create alerts.
+Doonsec WeChat RSS is currently treated as a low-confidence source: it is stored and aligned to products, but does not create alerts. GitHub Security Advisories enrich GHSA/CVE evidence without creating high-risk alerts directly; GitHub repository/code results are stored as GitHub evidence in the POC/EXP tabs.
 
 ## 模型分析 / Model-Assisted Analysis
 
@@ -508,6 +514,8 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8010/api/sources
 | `GET /api/alerts` | 告警列表 | alert list |
 | `PUT /api/monitor/rules` | 更新告警规则 | update alert rules |
 | `GET /api/vulnerabilities` | 漏洞列表 | vulnerability list |
+| `GET /api/vulnerabilities/{id}/github-evidence` | GitHub 证据列表 | GitHub evidence list |
+| `POST /api/vulnerabilities/{id}/github-evidence/refresh` | 刷新单条漏洞 GitHub 证据 | refresh GitHub evidence for one vulnerability |
 | `POST /api/vulnerabilities/{id}/analysis/run` | 提交漏洞分析 | enqueue analysis |
 | `GET /api/vulnerabilities/{id}/analysis/events` | 分析日志 | analysis logs |
 | `DELETE /api/vulnerabilities/{id}/analysis` | 删除分析结果 | delete analysis result |

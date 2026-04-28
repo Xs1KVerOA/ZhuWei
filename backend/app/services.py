@@ -8,6 +8,7 @@ from . import db
 from .async_utils import run_blocking
 from .analysis import queue_followed_analysis_for_items
 from .enrichment import enrich_items
+from .github_intel import enrich_items_with_github_evidence
 from .monitor import process_alerts
 from .product_resolution import resolve_products_direct, schedule_deepseek_flash_for_alerts
 from .sources import ADAPTERS
@@ -65,6 +66,11 @@ class SourceService:
 
             items = await enrich_items(items)
             count = await run_blocking(db.upsert_vulnerabilities, items)
+            github_evidence = await enrich_items_with_github_evidence(items) if items else {
+                "checked": 0,
+                "changed": 0,
+                "warning": "",
+            }
             product_alignment = await run_blocking(resolve_products_direct, items)
             alert_enabled = bool(getattr(adapter, "alert_enabled", True))
             alert_count = await run_blocking(process_alerts, items) if items and alert_enabled else 0
@@ -73,6 +79,9 @@ class SourceService:
             analysis_count = await run_blocking(queue_followed_analysis_for_items, items) if items else 0
             total_count = count + product_count
             source_warning = str(getattr(adapter, "last_warning", "") or "")
+            github_warning = str(github_evidence.get("warning") or "")
+            if github_warning:
+                source_warning = f"{source_warning}\n{github_warning}".strip()
             status = "partial" if source_warning else "success"
             await run_blocking(db.finish_run, run_id, name, status, total_count, source_warning)
             if force or alert_count or analysis_count or product_count or source_warning:
@@ -86,7 +95,8 @@ class SourceService:
                         f"产品 {product_count} 个，"
                         f"{'新增告警 ' + str(alert_count) + ' 条' if alert_enabled else '告警已跳过'}，"
                         f"触发分析 {analysis_count} 条，"
-                        f"产品归属 {product_alignment.get('linked', 0)} 条。"
+                        f"产品归属 {product_alignment.get('linked', 0)} 条，"
+                        f"GitHub 证据刷新 {github_evidence.get('checked', 0)} 条。"
                         f"{chr(10) + source_warning if source_warning else ''}"
                     ),
                     entity_type="source",
@@ -100,6 +110,7 @@ class SourceService:
                         "alert_count": alert_count,
                         "alert_enabled": alert_enabled,
                         "analysis_count": analysis_count,
+                        "github_evidence": github_evidence,
                         "warning": source_warning,
                     },
                 )
@@ -112,6 +123,7 @@ class SourceService:
                 "product_alignment": product_alignment,
                 "alert_count": alert_count,
                 "analysis_count": analysis_count,
+                "github_evidence": github_evidence,
                 "error": source_warning,
             }
         except Exception as exc:

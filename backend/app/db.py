@@ -22,11 +22,12 @@ except ImportError:  # pragma: no cover - PostgreSQL backend needs optional depe
 
 _db_lock = threading.RLock()
 POSTGRES_BACKENDS = {"postgres", "postgresql", "pg"}
-ALERT_EXCLUDED_SOURCES = {"doonsec_wechat"}
+ALERT_EXCLUDED_SOURCES = {"doonsec_wechat", "github_advisories"}
 POSTGRES_ID_TABLES = {
     "analysis_events",
     "analysis_feedback",
     "deepseek_balance_checks",
+    "github_evidence",
     "messages",
     "model_usage_events",
     "product_aliases",
@@ -94,6 +95,10 @@ VULNERABILITY_COLUMNS = [
     "product_match_confidence",
     "product_match_evidence",
     "product_resolved_at",
+    "github_evidence_checked_at",
+    "github_evidence_count",
+    "github_evidence_max_score",
+    "github_evidence_summary",
 ]
 
 
@@ -734,6 +739,35 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_source_archives_created
                 ON source_archives(created_at DESC);
 
+            CREATE TABLE IF NOT EXISTS github_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vulnerability_id INTEGER NOT NULL,
+                cve_id TEXT NOT NULL DEFAULT '',
+                query TEXT NOT NULL DEFAULT '',
+                evidence_type TEXT NOT NULL DEFAULT '',
+                artifact_kind TEXT NOT NULL DEFAULT 'unknown',
+                title TEXT NOT NULL DEFAULT '',
+                evidence_url TEXT NOT NULL DEFAULT '',
+                repository TEXT NOT NULL DEFAULT '',
+                evidence_path TEXT NOT NULL DEFAULT '',
+                snippet TEXT NOT NULL DEFAULT '',
+                score REAL NOT NULL DEFAULT 0,
+                confidence TEXT NOT NULL DEFAULT 'low',
+                source_api TEXT NOT NULL DEFAULT 'github',
+                raw TEXT NOT NULL DEFAULT '{}',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                UNIQUE(vulnerability_id, evidence_url, evidence_path),
+                FOREIGN KEY(vulnerability_id) REFERENCES vulnerabilities(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_github_evidence_vulnerability
+                ON github_evidence(vulnerability_id, score DESC, last_seen_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_github_evidence_kind
+                ON github_evidence(artifact_kind, score DESC);
+            CREATE INDEX IF NOT EXISTS idx_github_evidence_cve
+                ON github_evidence(cve_id);
+
             """
         )
         _ensure_columns(
@@ -780,6 +814,10 @@ def init_db() -> None:
                 "product_match_confidence": "REAL",
                 "product_match_evidence": "TEXT NOT NULL DEFAULT ''",
                 "product_resolved_at": "TEXT",
+                "github_evidence_checked_at": "TEXT NOT NULL DEFAULT ''",
+                "github_evidence_count": "INTEGER NOT NULL DEFAULT 0",
+                "github_evidence_max_score": "REAL",
+                "github_evidence_summary": "TEXT NOT NULL DEFAULT '{}'",
             },
         )
         _ensure_columns(
@@ -1202,6 +1240,219 @@ def refresh_quality_scores(limit: int = 500) -> dict[str, Any]:
         for row in rows:
             _refresh_vulnerability_quality_conn(conn, int(row["id"]))
     return {"status": "ok", "count": len(rows)}
+
+
+def upsert_github_evidence(
+    vulnerability_id: int,
+    evidence_items: list[dict[str, Any]],
+    *,
+    mark_checked: bool = True,
+) -> dict[str, Any]:
+    now = utc_now()
+    changed = 0
+    with connection() as conn:
+        if not conn.execute("SELECT id FROM vulnerabilities WHERE id=?", (vulnerability_id,)).fetchone():
+            return {"status": "missing", "changed": 0, "summary": {}}
+        for item in evidence_items:
+            evidence_url = _clip_text(item.get("url") or item.get("evidence_url"), 2000)
+            evidence_path = _clip_text(item.get("path") or item.get("evidence_path"), 1000)
+            if not evidence_url and not evidence_path:
+                continue
+            score = _bounded_float(item.get("score"), 0.0, 100.0)
+            confidence = str(item.get("confidence") or _github_confidence_label(score)).strip() or "low"
+            raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+            conn.execute(
+                """
+                INSERT INTO github_evidence (
+                    vulnerability_id, cve_id, query, evidence_type, artifact_kind,
+                    title, evidence_url, repository, evidence_path, snippet,
+                    score, confidence, source_api, raw, first_seen_at, last_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(vulnerability_id, evidence_url, evidence_path) DO UPDATE SET
+                    cve_id=excluded.cve_id,
+                    query=excluded.query,
+                    evidence_type=excluded.evidence_type,
+                    artifact_kind=excluded.artifact_kind,
+                    title=excluded.title,
+                    repository=excluded.repository,
+                    snippet=excluded.snippet,
+                    score=excluded.score,
+                    confidence=excluded.confidence,
+                    source_api=excluded.source_api,
+                    raw=excluded.raw,
+                    last_seen_at=excluded.last_seen_at
+                """,
+                (
+                    vulnerability_id,
+                    _clip_text(item.get("cve_id"), 64),
+                    _clip_text(item.get("query"), 1000),
+                    _clip_text(item.get("evidence_type") or item.get("type"), 64),
+                    _clip_text(item.get("artifact_kind") or "unknown", 32),
+                    _clip_text(item.get("title"), 500),
+                    evidence_url,
+                    _clip_text(item.get("repository"), 255),
+                    evidence_path,
+                    _clip_text(item.get("snippet"), 4000),
+                    score,
+                    confidence[:32],
+                    _clip_text(item.get("source_api") or "github", 64),
+                    json.dumps(raw, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            changed += 1
+        summary = _refresh_github_evidence_summary_conn(conn, vulnerability_id, checked_at=now if mark_checked else "")
+    return {"status": "ok", "changed": changed, "summary": summary}
+
+
+def list_github_evidence(vulnerability_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    limit = max(1, min(limit, 100))
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM github_evidence
+            WHERE vulnerability_id=?
+            ORDER BY score DESC, last_seen_at DESC, id DESC
+            LIMIT ?
+            """,
+            (vulnerability_id, limit),
+        ).fetchall()
+    return [_deserialize_github_evidence(dict(row)) for row in rows]
+
+
+def github_evidence_needs_refresh(vulnerability_id: int, max_age_hours: int = 24) -> bool:
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT github_evidence_checked_at FROM vulnerabilities WHERE id=?",
+            (vulnerability_id,),
+        ).fetchone()
+    if row is None:
+        return False
+    checked_at = _parse_datetime(row["github_evidence_checked_at"])
+    if checked_at is None:
+        return True
+    return datetime.now(timezone.utc) - checked_at >= timedelta(hours=max(1, max_age_hours))
+
+
+def mark_github_evidence_checked(vulnerability_id: int, note: str = "") -> dict[str, Any]:
+    with connection() as conn:
+        summary = _refresh_github_evidence_summary_conn(
+            conn,
+            vulnerability_id,
+            checked_at=utc_now(),
+            note=note,
+        )
+    return {"status": "ok", "summary": summary}
+
+
+def recent_vulnerabilities_for_github_evidence(limit: int = 20) -> list[dict[str, Any]]:
+    limit = max(1, min(limit, 200))
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM vulnerabilities
+            WHERE COALESCE(cve_id, '') <> ''
+              AND (
+                COALESCE(github_evidence_checked_at, '') = ''
+                OR github_evidence_checked_at < ?
+              )
+            ORDER BY COALESCE(published_at, updated_at, first_seen_at) DESC, id DESC
+            LIMIT ?
+            """,
+            ((datetime.now(timezone.utc) - timedelta(hours=settings.github_evidence_refresh_hours)).isoformat(timespec="seconds"), limit),
+        ).fetchall()
+    return [_deserialize_vuln(dict(row)) for row in rows]
+
+
+def _refresh_github_evidence_summary_conn(
+    conn: sqlite3.Connection,
+    vulnerability_id: int,
+    *,
+    checked_at: str = "",
+    note: str = "",
+) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total,
+            COALESCE(MAX(score), 0) AS max_score,
+            SUM(CASE WHEN artifact_kind='poc' THEN 1 ELSE 0 END) AS poc_count,
+            SUM(CASE WHEN artifact_kind='exp' THEN 1 ELSE 0 END) AS exp_count,
+            SUM(CASE WHEN evidence_type='advisory' THEN 1 ELSE 0 END) AS advisory_count,
+            SUM(CASE WHEN evidence_type='code' THEN 1 ELSE 0 END) AS code_count,
+            SUM(CASE WHEN evidence_type='repository' THEN 1 ELSE 0 END) AS repository_count
+        FROM github_evidence
+        WHERE vulnerability_id=?
+        """,
+        (vulnerability_id,),
+    ).fetchone()
+    total = int(row["total"] or 0) if row else 0
+    max_score = float(row["max_score"] or 0) if row else 0.0
+    summary = {
+        "total": total,
+        "max_score": round(max_score, 1),
+        "confidence": _github_confidence_label(max_score),
+        "poc_count": int(row["poc_count"] or 0) if row else 0,
+        "exp_count": int(row["exp_count"] or 0) if row else 0,
+        "advisory_count": int(row["advisory_count"] or 0) if row else 0,
+        "code_count": int(row["code_count"] or 0) if row else 0,
+        "repository_count": int(row["repository_count"] or 0) if row else 0,
+        "note": note,
+    }
+    assignments = [
+        "github_evidence_count=?",
+        "github_evidence_max_score=?",
+        "github_evidence_summary=?",
+    ]
+    args: list[Any] = [
+        total,
+        max_score if total else None,
+        json.dumps(summary, ensure_ascii=False),
+    ]
+    if checked_at:
+        assignments.append("github_evidence_checked_at=?")
+        args.append(checked_at)
+    args.append(vulnerability_id)
+    conn.execute(
+        f"UPDATE vulnerabilities SET {', '.join(assignments)} WHERE id=?",
+        args,
+    )
+    return summary
+
+
+def _deserialize_github_evidence(row: dict[str, Any]) -> dict[str, Any]:
+    row["raw"] = _json_value(row.get("raw"), {})
+    row["score"] = round(float(row.get("score") or 0), 1)
+    row["confidence"] = row.get("confidence") or _github_confidence_label(row["score"])
+    return row
+
+
+def _github_confidence_label(score: float | int | None) -> str:
+    value = float(score or 0)
+    if value >= 78:
+        return "high"
+    if value >= 55:
+        return "medium"
+    return "low"
+
+
+def _bounded_float(value: Any, minimum: float, maximum: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = minimum
+    return max(minimum, min(maximum, round(number, 2)))
+
+
+def _clip_text(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -3439,6 +3690,17 @@ def _deserialize_vuln(row: dict[str, Any]) -> dict[str, Any]:
     )
     row["product_match_evidence"] = row.get("product_match_evidence") or ""
     row["product_resolved_at"] = row.get("product_resolved_at") or ""
+    row["github_evidence_checked_at"] = row.get("github_evidence_checked_at") or ""
+    row["github_evidence_count"] = int(row.get("github_evidence_count") or 0)
+    row["github_evidence_max_score"] = (
+        None if row.get("github_evidence_max_score") is None else float(row.get("github_evidence_max_score") or 0)
+    )
+    row["github_evidence_summary"] = _json_value(row.get("github_evidence_summary"), {})
+    row["github_evidence"] = (
+        list_github_evidence(int(row["id"]), limit=8)
+        if row.get("id") and row["github_evidence_count"]
+        else []
+    )
     row["quality_raw"] = _json_value(row.get("quality_raw"), {})
     if row.get("quality_score") is None:
         quality = compute_quality_score(row)
@@ -5494,7 +5756,11 @@ def list_alerts(
 ) -> dict[str, Any]:
     clauses: list[str] = []
     args: list[Any] = []
-    clauses.append("v.source NOT IN ('doonsec_wechat')")
+    if ALERT_EXCLUDED_SOURCES:
+        clauses.append(
+            f"v.source NOT IN ({', '.join('?' for _ in ALERT_EXCLUDED_SOURCES)})"
+        )
+        args.extend(sorted(ALERT_EXCLUDED_SOURCES))
     if status:
         clauses.append("a.status = ?")
         args.append(status)

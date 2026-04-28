@@ -51,6 +51,11 @@ from .deepseek import (
     set_deepseek_api_key,
 )
 from .enrichment import backfill_missing_cvss
+from .github_intel import (
+    GitHubSearchError,
+    refresh_github_evidence_for_vulnerability,
+    refresh_recent_github_evidence,
+)
 from .infra import infrastructure_status
 from .monitor import current_alert_filters, get_monitor_rules, set_monitor_rules
 from .neo4j_graph import graph_status, product_neighborhood, sync_graph, vulnerability_neighborhood
@@ -786,6 +791,28 @@ async def get_vulnerability(vulnerability_id: int, _: None = Depends(require_aut
     if not vulnerability:
         raise HTTPException(status_code=404, detail="vulnerability not found")
     return vulnerability
+
+
+@app.get("/api/vulnerabilities/{vulnerability_id}/github-evidence")
+async def get_vulnerability_github_evidence(vulnerability_id: int, _: None = Depends(require_auth)):
+    if not await run_blocking(db.get_vulnerability, vulnerability_id):
+        raise HTTPException(status_code=404, detail="vulnerability not found")
+    return {"data": await run_blocking(db.list_github_evidence, vulnerability_id)}
+
+
+@app.post("/api/vulnerabilities/{vulnerability_id}/github-evidence/refresh")
+async def refresh_vulnerability_github_evidence(vulnerability_id: int, _: None = Depends(require_auth)):
+    try:
+        return await refresh_github_evidence_for_vulnerability(vulnerability_id, force=True)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubSearchError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+
+@app.post("/api/github-evidence/refresh-recent")
+async def refresh_recent_github_evidence_endpoint(limit: int = 20, _: None = Depends(require_auth)):
+    return await refresh_recent_github_evidence(limit=max(1, min(limit, 100)))
 
 
 @app.get("/api/analysis")

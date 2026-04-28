@@ -123,6 +123,16 @@ class Settings:
     update_cli_allowed_tools: str
     update_encryption_key: str
     update_require_encryption: bool
+    github_token: str
+    github_user_agent: str
+    github_search_timeout_seconds: int
+    github_advisory_max_pages: int
+    github_advisory_page_size: int
+    github_evidence_enabled: bool
+    github_evidence_auto_search_enabled: bool
+    github_evidence_auto_search_per_run: int
+    github_evidence_search_max_results: int
+    github_evidence_refresh_hours: int
 
     regular_interval_minutes: int = 30
     slow_cron_hours: str = "10,18"
@@ -326,6 +336,20 @@ class Settings:
                 ]
             ),
         )
+        self.github_token = (
+            os.getenv("GITHUB_TOKEN")
+            or os.getenv("GITHUB_API_TOKEN")
+            or ""
+        ).strip()
+        self.github_user_agent = os.getenv("GITHUB_USER_AGENT", "ZhuWei-Vulnerability-Intel").strip() or "ZhuWei-Vulnerability-Intel"
+        self.github_search_timeout_seconds = max(5, min(_int_env("GITHUB_SEARCH_TIMEOUT_SECONDS", 25), 120))
+        self.github_advisory_max_pages = max(1, min(_int_env("GITHUB_ADVISORY_MAX_PAGES", 1), 10))
+        self.github_advisory_page_size = max(10, min(_int_env("GITHUB_ADVISORY_PAGE_SIZE", 100), 100))
+        self.github_evidence_enabled = _bool_env("GITHUB_EVIDENCE_ENABLED", True)
+        self.github_evidence_auto_search_enabled = _bool_env("GITHUB_EVIDENCE_AUTO_SEARCH_ENABLED", True)
+        self.github_evidence_auto_search_per_run = max(0, min(_int_env("GITHUB_EVIDENCE_AUTO_SEARCH_PER_RUN", 5), 50))
+        self.github_evidence_search_max_results = max(1, min(_int_env("GITHUB_EVIDENCE_SEARCH_MAX_RESULTS", 8), 30))
+        self.github_evidence_refresh_hours = max(1, min(_int_env("GITHUB_EVIDENCE_REFRESH_HOURS", 24), 24 * 14))
 
     def claude_code_env(self) -> dict[str, str]:
         return {
