@@ -8,6 +8,7 @@ from .analysis import cleanup_expired_source_artifacts_sync
 from .config import settings
 from .deepseek import refresh_deepseek_balance_sync
 from .enrichment import backfill_missing_cvss_sync
+from .github_intel import refresh_recent_github_evidence_sync
 from .services import source_service
 
 
@@ -49,6 +50,15 @@ def configure_scheduler() -> None:
         IntervalTrigger(minutes=30),
         id="nvd_cvss_backfill",
         name="NVD CVSS backfill every 30 minutes",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        refresh_recent_github_evidence_sync,
+        IntervalTrigger(minutes=30),
+        id="github_evidence_backfill",
+        name="GitHub evidence backfill every 30 minutes",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

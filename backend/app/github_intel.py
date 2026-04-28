@@ -110,6 +110,15 @@ async def refresh_recent_github_evidence(limit: int = 20) -> dict[str, Any]:
     return {"status": "partial" if warning else "ok", "checked": checked, "changed": changed, "warning": warning}
 
 
+def refresh_recent_github_evidence_sync(limit: int | None = None) -> None:
+    if not settings.github_evidence_enabled or not settings.github_evidence_auto_search_enabled:
+        return
+    budget = settings.github_evidence_auto_search_per_run if limit is None else limit
+    if budget <= 0:
+        return
+    asyncio.run(refresh_recent_github_evidence(limit=budget))
+
+
 async def _search_github_evidence(vulnerability: dict[str, Any], target: str) -> list[dict[str, Any]]:
     headers = _github_headers()
     timeout = settings.github_search_timeout_seconds
