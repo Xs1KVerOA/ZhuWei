@@ -6,7 +6,7 @@ import hmac
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import httpx
 
@@ -57,6 +57,11 @@ def upload_file(path: Path, object_key: str, *, content_type: str = "application
         "object_key": object_key,
         "url": client.object_url(object_key),
     }
+
+
+def presigned_get_url(object_key: str, *, expires_seconds: int = 900) -> str:
+    client = MinioS3Client()
+    return client.presigned_get_url(object_key, expires_seconds=expires_seconds)
 
 
 def delete_object(object_key: str) -> bool:
@@ -113,6 +118,45 @@ class MinioS3Client:
     def object_url(self, object_key: str) -> str:
         path = quote(f"/{self.bucket}/{object_key}", safe="/-_.~")
         return f"{self.endpoint}{path}"
+
+    def presigned_get_url(self, object_key: str, *, expires_seconds: int = 900) -> str:
+        safe_key = "/".join(part for part in object_key.split("/") if part)
+        expires = max(1, min(int(expires_seconds or 900), 604800))
+        now = dt.datetime.now(dt.timezone.utc)
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date_stamp = now.strftime("%Y%m%d")
+        credential_scope = f"{date_stamp}/{self.region}/s3/aws4_request"
+        canonical_uri = quote(f"/{self.bucket}/{safe_key}", safe="/-_.~")
+        query = {
+            "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+            "X-Amz-Credential": f"{settings.minio_access_key}/{credential_scope}",
+            "X-Amz-Date": amz_date,
+            "X-Amz-Expires": str(expires),
+            "X-Amz-SignedHeaders": "host",
+        }
+        canonical_query = urlencode(sorted(query.items()), quote_via=quote, safe="-_.~")
+        canonical_headers = f"host:{self.host}\n"
+        canonical_request = "\n".join(
+            [
+                "GET",
+                canonical_uri,
+                canonical_query,
+                canonical_headers,
+                "host",
+                "UNSIGNED-PAYLOAD",
+            ]
+        )
+        string_to_sign = "\n".join(
+            [
+                "AWS4-HMAC-SHA256",
+                amz_date,
+                credential_scope,
+                hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+            ]
+        )
+        signing_key = _signing_key(settings.minio_secret_key, date_stamp, self.region)
+        signature = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+        return f"{self.endpoint}{canonical_uri}?{canonical_query}&X-Amz-Signature={signature}"
 
     def delete_object(self, object_key: str) -> httpx.Response:
         safe_key = "/".join(part for part in object_key.split("/") if part)

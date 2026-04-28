@@ -2140,8 +2140,8 @@ function sourceArchiveMarkup(item) {
   const aliases = (item.suggested_aliases || []).join("，");
   const productName = item.product_name || item.suggested_product_name || item.product_hint || "";
   const minioClass = item.minio_status === "uploaded" ? "found" : item.minio_status === "failed" ? "missing" : "pending";
-  const minioAction = item.minio_url
-    ? `<a class="intel-button active" href="${esc(item.minio_url)}" target="_blank" rel="noreferrer">MinIO</a>`
+  const minioAction = item.minio_download_url
+    ? `<a class="intel-button active" href="${esc(item.minio_download_url)}" target="_blank" rel="noreferrer">MinIO</a>`
     : `<button type="button" class="intel-button" data-source-retry-minio="${esc(item.id)}">重试 MinIO</button>`;
   return `
     <article class="source-archive-item ${esc(item.status || "")}">
@@ -2192,8 +2192,8 @@ function sourceArchiveDetailHtml(item) {
   const languages = manifest.languages || [];
   const sampleFiles = manifest.sample_files || [];
   const manifestNames = Object.keys(manifest.manifests || {});
-  const minio = item.minio_url
-    ? `<a href="${esc(item.minio_url)}" target="_blank" rel="noreferrer">${esc(item.minio_object_key || item.minio_url)}</a>`
+  const minio = item.minio_download_url
+    ? `<a href="${esc(item.minio_download_url)}" target="_blank" rel="noreferrer">${esc(item.minio_object_key || "下载源码包")}</a>`
     : `<span>${esc(item.minio_error || minioStatusLabel(item.minio_status))}</span>`;
   return `
     <div class="source-detail">

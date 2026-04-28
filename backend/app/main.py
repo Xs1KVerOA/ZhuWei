@@ -57,6 +57,7 @@ from .github_intel import (
     refresh_recent_github_evidence,
 )
 from .infra import infrastructure_status
+from .minio_store import presigned_get_url
 from .monitor import current_alert_filters, get_monitor_rules, set_monitor_rules
 from .neo4j_graph import graph_status, product_neighborhood, sync_graph, vulnerability_neighborhood
 from .product_resolution import backfill_products_direct, schedule_deepseek_flash_for_alerts
@@ -503,10 +504,26 @@ async def retry_source_archive_minio(archive_id: int, _: None = Depends(require_
     return {"status": "ok", "data": _public_source_archive(archive)}
 
 
+@app.get("/api/source-archives/{archive_id}/download")
+async def download_source_archive(archive_id: int, _: None = Depends(require_auth)):
+    archive = await run_blocking(db.get_source_archive, archive_id)
+    if not archive:
+        raise HTTPException(status_code=404, detail="source archive not found")
+    if archive.get("minio_status") != "uploaded" or not archive.get("minio_object_key"):
+        raise HTTPException(status_code=404, detail="source archive is not available in MinIO")
+    try:
+        url = await run_blocking(presigned_get_url, str(archive["minio_object_key"]), expires_seconds=900)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"failed to create MinIO download URL: {str(exc)[:300]}") from exc
+    return RedirectResponse(url=url, status_code=302)
+
+
 def _public_source_archive(archive: dict[str, Any]) -> dict[str, Any]:
     public = dict(archive or {})
     for key in ["local_path", "extracted_path"]:
         public[key] = _display_managed_path(str(public.get(key) or ""))
+    if public.get("minio_status") == "uploaded" and public.get("minio_object_key"):
+        public["minio_download_url"] = f"/api/source-archives/{public.get('id')}/download"
     return public
 
 

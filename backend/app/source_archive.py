@@ -1032,7 +1032,7 @@ def _clean_aliases(values: Any) -> list[str]:
 def _minio_object_key(archive: dict[str, Any], path: Path) -> str:
     digest = str(archive.get("sha256") or "")[:16] or uuid.uuid4().hex[:16]
     filename = _safe_filename(str(archive.get("filename") or path.name)) or path.name
-    return f"source-archives/{archive.get('id')}/{digest}-{filename}"
+    return f"{archive.get('id')}/{digest}-{filename}"
 
 
 def _upload_root() -> Path:
