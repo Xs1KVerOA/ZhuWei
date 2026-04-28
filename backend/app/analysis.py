@@ -716,12 +716,13 @@ def _persist_analysis_result(
 ) -> dict[str, Any] | None:
     sources = _source_refs(parsed)
     source_repositories = _source_repository_refs(parsed)
-    source_artifact = _source_artifact_metadata(
+    source_artifacts = _source_artifacts_metadata(
         vulnerability_id,
         run_id,
         workspace,
         source_repositories,
     )
+    source_artifact = source_artifacts[0] if source_artifacts else _empty_source_artifact()
     poc_content = _artifact_content(parsed, "poc")
     exp_content = _artifact_content(parsed, "exp")
     poc_status = _artifact_validation_label(parsed, "poc")
@@ -764,6 +765,7 @@ def _persist_analysis_result(
         "source_found": source_found,
         "source_found_label": source_label,
         "source_artifact": source_artifact,
+        "source_artifacts": source_artifacts,
         "poc_validation": poc_status,
         "exp_validation": exp_status,
     }
@@ -789,14 +791,23 @@ def _persist_analysis_result(
         exp_content=exp_content,
     )
     try:
-        archived_source = register_analysis_source_artifact(updated or vuln, source_artifact)
-        if archived_source:
+        archived_sources = []
+        seen_archive_paths: set[str] = set()
+        for artifact in source_artifacts or [source_artifact]:
+            archive_path = str(artifact.get("archive_path") or "")
+            if archive_path in seen_archive_paths:
+                continue
+            seen_archive_paths.add(archive_path)
+            archived_source = register_analysis_source_artifact(updated or vuln, artifact)
+            if archived_source:
+                archived_sources.append(archived_source)
+        if archived_sources:
             _analysis_event(
                 vulnerability_id,
                 run_id,
                 "source",
-                "源码压缩包已加入源码库，后台会异步上传 MinIO 并等待产品确认。",
-                {"source_archive_id": archived_source.get("id")},
+                f"{len(archived_sources)} 个源码版本压缩包已加入源码库，后台会异步上传 MinIO 并等待产品确认。",
+                {"source_archive_ids": [item.get("id") for item in archived_sources]},
             )
     except Exception:
         logger.warning("failed to register source artifact for vulnerability %s", vulnerability_id, exc_info=True)
@@ -1126,12 +1137,17 @@ def _existing_source_context(vuln: dict[str, Any]) -> dict[str, Any]:
     source_found = bool(vuln.get("analysis_source_found"))
     local_path = str(vuln.get("analysis_source_local_path") or "").strip()
     archive_path = str(vuln.get("analysis_source_archive_path") or "").strip()
+    raw = vuln.get("analysis_raw")
+    source_artifacts = raw.get("source_artifacts") if isinstance(raw, dict) else []
+    if not isinstance(source_artifacts, list):
+        source_artifacts = []
     return {
         "source_found": source_found,
         "title": str(vuln.get("analysis_source_title") or "").strip(),
         "url": str(vuln.get("analysis_source_url") or "").strip(),
         "local_path": local_path,
         "archive_path": archive_path,
+        "artifacts": source_artifacts[:10],
         "retained_until": str(vuln.get("analysis_source_retained_until") or "").strip(),
         "cleaned_at": str(vuln.get("analysis_source_cleaned_at") or "").strip(),
         "local_path_exists": bool(local_path and Path(local_path).exists()),
@@ -1166,9 +1182,10 @@ def _two_stage_prompt(payload: dict[str, Any], model_profile: dict[str, Any], re
 3. 明确输出“本地源码版本是否落在受影响范围内”：affected / fixed / unknown / mismatch。若 mismatch 或 unknown 会影响根因、POC/EXP 可用性判断，再使用 WebSearch/WebFetch 搜索现网源码、受影响版本包、修复版本包或补丁提交。
 4. 如果没有可用本地源码，使用 WebSearch 在官网、npm、PyPI、GitHub、GitLab 搜索产品源码或包源码。搜索顺序：官方仓库/官网源码链接 -> GitHub/GitLab 组织仓库 -> npm 包 -> PyPI 包 -> 其他公开镜像。
 5. 找到源码后下载到当前工作目录，优先使用 git clone；npm/PyPI 包可使用 npm pack 或 pip download 后解包。
-6. 只阅读与漏洞有关的路由、控制器、解析器、依赖版本、补丁提交、变更记录，不做大范围无关扫描。
-7. 结合源码验证 POC/EXP 是否真实有效：定位受影响函数/文件/版本，说明触发路径、失败条件、以及本地源码版本对结论的影响。
-8. 如果找不到可下载源码，直接跳过源码验证，不得因此判定整个分析失败；`source_found=false`，`source_found_label="源码未找到"`。若数据库中已有历史源码证据，请在 `source_analysis` 说明“本轮未找到新源码，但保留历史源码证据”。
+6. 在存在可下载源码时，必须尝试同时获取两个源码版本：漏洞涉及的受影响版本（version_role=`affected`）和当前最新发布 / 最新 tag / 默认分支版本（version_role=`latest`），不要只下载存在问题的版本。两个版本应使用不同 `local_path`；如果只能获取一个版本，也必须在 `source_repositories` 中写明 `version`、`version_role` 和原因，无法判断则用 `unknown`。
+7. 只阅读与漏洞有关的路由、控制器、解析器、依赖版本、补丁提交、变更记录，不做大范围无关扫描。
+8. 结合源码验证 POC/EXP 是否真实有效：定位受影响函数/文件/版本，说明触发路径、失败条件、以及本地源码版本对结论的影响。
+9. 如果找不到可下载源码，直接跳过源码验证，不得因此判定整个分析失败；`source_found=false`，`source_found_label="源码未找到"`。若数据库中已有历史源码证据，请在 `source_analysis` 说明“本轮未找到新源码，但保留历史源码证据”。
 
 ### 阶段三：红队增强 EXP / 防御输出
 {exp_instruction}
@@ -1195,7 +1212,7 @@ JSON schema:
   "source_found": true,
   "source_found_label": "源码已找到 | 源码未找到",
   "source_analysis": "源码仓库、文件路径、函数/类、受影响版本、本地源码版本、版本匹配结论和触发路径；没有源码则说明已跳过",
-  "source_version_assessment": {{"alert_affected_versions": "...", "local_source_version": "...", "match": "affected | fixed | unknown | mismatch", "impact_on_analysis": "...", "needs_online_source": false}},
+  "source_version_assessment": {{"alert_affected_versions": "...", "local_source_version": "...", "latest_source_version": "...", "match": "affected | fixed | unknown | mismatch", "impact_on_analysis": "...", "needs_online_source": false}},
   "public_poc_exp": [
     {{"kind": "poc | exp", "title": "...", "url": "...", "local_path": "...", "validation": "usable | partial | unverified | invalid | not_found", "evidence": "..."}}
   ],
@@ -1211,7 +1228,7 @@ JSON schema:
   "exp_command_example": "python3 exploit.py -t 192.168.1.100 -p 8080",
   "remediation": "修复建议、升级版本、临时缓解、检测排查步骤",
   "references": [{{"title": "...", "url": "..."}}],
-  "source_repositories": [{{"name": "...", "url": "...", "local_path": "..."}}],
+  "source_repositories": [{{"name": "...", "url": "...", "local_path": "...", "version": "...", "version_role": "affected | latest | uploaded | unknown", "evidence": "版本来源，例如 tag、package manifest、release 页面"}}],
   "confidence": 0.0
 }}
 """.strip()
@@ -1363,28 +1380,87 @@ def _source_repository_refs(parsed: dict[str, Any]) -> list[dict[str, Any]]:
             url = str(value.get("url") or "").strip()
             local_path = str(value.get("local_path") or "").strip()
             name = str(value.get("name") or value.get("title") or url or local_path).strip()
+            source_version = str(value.get("source_version") or value.get("version") or "").strip()
+            version_role = _normalize_source_version_role(value.get("version_role") or value.get("role") or "")
+            evidence = str(value.get("evidence") or value.get("version_evidence") or "").strip()
             if url or local_path:
-                refs.append({"title": name, "url": url, "local_path": local_path, "kind": "source"})
+                refs.append(
+                    {
+                        "title": name,
+                        "url": url,
+                        "local_path": local_path,
+                        "kind": "source",
+                        "source_version": source_version,
+                        "version": source_version,
+                        "version_role": version_role,
+                        "evidence": evidence,
+                    }
+                )
     return refs
 
 
-def _source_artifact_metadata(
+def _source_artifacts_metadata(
     vulnerability_id: int,
     run_id: str,
     workspace: Path,
     source_refs: list[dict[str, Any]],
-) -> dict[str, str]:
-    local_paths = _source_local_paths(workspace, source_refs)
-    primary = _primary_source_ref(source_refs)
-    archive_path = _archive_source_paths(vulnerability_id, run_id, workspace, local_paths)
+) -> list[dict[str, str]]:
+    _source_local_paths(workspace, source_refs)
     retained_until = (
         datetime.now(timezone.utc) + timedelta(days=settings.vulnerability_source_retention_days)
     ).isoformat(timespec="seconds")
-    if archive_path:
-        primary["archive_path"] = archive_path
-        primary["retained_until"] = retained_until
-        primary["cleanup_paths"] = [str(path) for path in local_paths]
-    return primary
+    artifacts: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for index, ref in enumerate(source_refs):
+        local_path_text = str(ref.get("local_path") or "").strip()
+        if not local_path_text:
+            continue
+        try:
+            local_path = Path(local_path_text).resolve()
+        except OSError:
+            continue
+        key = str(local_path)
+        if key in seen_paths or not local_path.exists():
+            continue
+        seen_paths.add(key)
+        version_role = _normalize_source_version_role(ref.get("version_role"))
+        archive_path = _archive_source_path(vulnerability_id, run_id, workspace, local_path, index, version_role)
+        artifact = _source_artifact_from_ref(ref)
+        if archive_path:
+            artifact["archive_path"] = archive_path
+            artifact["retained_until"] = retained_until
+            artifact["cleanup_paths"] = [str(local_path)]
+        artifacts.append(artifact)
+    if artifacts:
+        return artifacts
+    primary = _primary_source_ref(source_refs)
+    return [primary] if primary.get("url") or primary.get("local_path") else []
+
+
+def _empty_source_artifact() -> dict[str, str]:
+    return {
+        "title": "",
+        "url": "",
+        "local_path": "",
+        "archive_path": "",
+        "retained_until": "",
+        "source_version": "",
+        "version_role": "",
+        "version_evidence": "",
+    }
+
+
+def _source_artifact_from_ref(ref: dict[str, Any]) -> dict[str, str]:
+    return {
+        "title": str(ref.get("title") or ref.get("name") or ref.get("url") or ref.get("local_path") or "源码").strip(),
+        "url": str(ref.get("url") or "").strip(),
+        "local_path": str(ref.get("local_path") or "").strip(),
+        "archive_path": "",
+        "retained_until": "",
+        "source_version": str(ref.get("source_version") or ref.get("version") or "").strip()[:120],
+        "version_role": _normalize_source_version_role(ref.get("version_role")),
+        "version_evidence": str(ref.get("evidence") or ref.get("version_evidence") or "").strip()[:500],
+    }
 
 
 def _primary_source_ref(source_refs: list[dict[str, Any]]) -> dict[str, str]:
@@ -1399,8 +1475,27 @@ def _primary_source_ref(source_refs: list[dict[str, Any]]) -> dict[str, str]:
                 "local_path": local_path,
                 "archive_path": "",
                 "retained_until": "",
+                "source_version": str(ref.get("source_version") or ref.get("version") or "").strip()[:120],
+                "version_role": _normalize_source_version_role(ref.get("version_role")),
+                "version_evidence": str(ref.get("evidence") or ref.get("version_evidence") or "").strip()[:500],
             }
-    return {"title": "", "url": "", "local_path": "", "archive_path": "", "retained_until": ""}
+    return _empty_source_artifact()
+
+
+def _normalize_source_version_role(value: Any) -> str:
+    text = re.sub(r"[^a-z_]+", "_", str(value or "").strip().lower()).strip("_")
+    mapping = {
+        "vulnerable": "affected",
+        "vulnerability": "affected",
+        "problem": "affected",
+        "fixed": "latest",
+        "current": "latest",
+        "newest": "latest",
+        "upload": "uploaded",
+        "user_upload": "uploaded",
+    }
+    normalized = mapping.get(text, text)
+    return normalized if normalized in {"affected", "latest", "uploaded", "unknown"} else "unknown"
 
 
 def _source_local_paths(workspace: Path, source_refs: list[dict[str, Any]]) -> list[Path]:
@@ -1428,30 +1523,32 @@ def _source_local_paths(workspace: Path, source_refs: list[dict[str, Any]]) -> l
     return paths
 
 
-def _archive_source_paths(
+def _archive_source_path(
     vulnerability_id: int,
     run_id: str,
     workspace: Path,
-    source_paths: list[Path],
+    source_path: Path,
+    index: int,
+    version_role: str,
 ) -> str:
-    if not source_paths:
+    if not source_path.exists():
         return ""
     archive_dir = workspace / "_source_archives"
     archive_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = archive_dir / f"{vulnerability_id}-{run_id[:8]}-source.zip"
+    suffix = version_role or "source"
+    archive_path = archive_dir / f"{vulnerability_id}-{run_id[:8]}-{index + 1}-{suffix}-source.zip"
     workspace_resolved = workspace.resolve()
     try:
         with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as zf:
-            for source_path in source_paths:
-                if source_path.is_dir():
-                    for child in source_path.rglob("*"):
-                        if not child.is_file():
-                            continue
-                        if ".git" in child.parts or "_source_archives" in child.parts:
-                            continue
-                        zf.write(child, child.relative_to(workspace_resolved))
-                elif source_path.is_file():
-                    zf.write(source_path, source_path.relative_to(workspace_resolved))
+            if source_path.is_dir():
+                for child in source_path.rglob("*"):
+                    if not child.is_file():
+                        continue
+                    if ".git" in child.parts or "_source_archives" in child.parts:
+                        continue
+                    zf.write(child, child.relative_to(workspace_resolved))
+            elif source_path.is_file():
+                zf.write(source_path, source_path.relative_to(workspace_resolved))
     except OSError:
         logger.warning("failed to archive source paths for vulnerability %s", vulnerability_id, exc_info=True)
         return ""
@@ -1509,10 +1606,18 @@ def _cleanup_paths_from_row(row: dict[str, Any]) -> list[str]:
             payload = json.loads(str(raw))
         except (TypeError, json.JSONDecodeError):
             payload = {}
-        artifact = payload.get("source_artifact") if isinstance(payload, dict) else {}
-        cleanup_paths = artifact.get("cleanup_paths") if isinstance(artifact, dict) else []
-        if isinstance(cleanup_paths, list):
-            paths.extend(str(item) for item in cleanup_paths if item)
+        artifacts: list[dict[str, Any]] = []
+        if isinstance(payload, dict):
+            artifact = payload.get("source_artifact")
+            if isinstance(artifact, dict):
+                artifacts.append(artifact)
+            source_artifacts = payload.get("source_artifacts")
+            if isinstance(source_artifacts, list):
+                artifacts.extend(item for item in source_artifacts if isinstance(item, dict))
+        for artifact in artifacts:
+            cleanup_paths = artifact.get("cleanup_paths")
+            if isinstance(cleanup_paths, list):
+                paths.extend(str(item) for item in cleanup_paths if item)
     local_path = str(row.get("analysis_source_local_path") or "")
     if local_path:
         paths.append(local_path)

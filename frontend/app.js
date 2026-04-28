@@ -12,6 +12,7 @@ const state = {
   productOffset: 0,
   productExpanded: false,
   sourceArchiveQ: "",
+  sourceArchiveVersionRole: "",
   graphQuery: "",
   graphKind: "auto",
   graphDepth: 1,
@@ -2136,6 +2137,18 @@ function minioStatusLabel(value) {
   return labels[value] || value || "-";
 }
 
+function sourceVersionLabel(item) {
+  const roleLabels = {
+    uploaded: "上传版本",
+    affected: "受影响版本",
+    latest: "最新版本",
+    unknown: "未知版本",
+  };
+  const role = roleLabels[item.version_role] || item.version_role || "版本";
+  const version = item.source_version || "";
+  return version ? `${role} ${version}` : role;
+}
+
 function sourceArchiveMarkup(item) {
   const aliases = (item.suggested_aliases || []).join("，");
   const productName = item.product_name || item.suggested_product_name || item.product_hint || "";
@@ -2150,6 +2163,7 @@ function sourceArchiveMarkup(item) {
           <h3>${esc(item.filename || "源码包")}</h3>
           <div class="meta">
             ${esc(item.origin || "upload")} · ${esc(bytesLabel(item.size_bytes))} · ${esc(formatTime(item.created_at))}
+            ${item.source_version || item.version_role ? ` · ${esc(sourceVersionLabel(item))}` : ""}
             ${item.sha256 ? ` · ${esc(String(item.sha256).slice(0, 12))}` : ""}
           </div>
         </div>
@@ -2161,6 +2175,7 @@ function sourceArchiveMarkup(item) {
       <div class="source-archive-summary">
         <div class="kv"><span>建议产品</span><strong>${esc(item.suggested_product_name || item.product_hint || "-")}</strong></div>
         <div class="kv"><span>确认产品</span><strong>${esc(item.product_name || (item.product_confirmed ? "-" : "待确认"))}</strong></div>
+        <div class="kv"><span>源码版本</span><strong>${esc(item.source_version || "-")}</strong></div>
         <div class="kv"><span>厂商</span><strong>${esc(item.suggested_vendor || "-")}</strong></div>
       </div>
       ${item.architecture_summary ? `<p><strong>架构</strong>${esc(textPreview(item.architecture_summary, 260))}</p>` : ""}
@@ -2200,6 +2215,8 @@ function sourceArchiveDetailHtml(item) {
       <div class="source-detail-grid">
         <div class="kv"><span>状态</span><strong>${esc(sourceArchiveStatusLabel(item.status))}</strong></div>
         <div class="kv"><span>MinIO</span><strong>${esc(minioStatusLabel(item.minio_status))}</strong></div>
+        <div class="kv"><span>源码版本</span><strong>${esc(item.source_version || "-")}</strong></div>
+        <div class="kv"><span>版本类型</span><strong>${esc(sourceVersionLabel(item))}</strong></div>
         <div class="kv"><span>大小</span><strong>${esc(bytesLabel(item.size_bytes))}</strong></div>
         <div class="kv"><span>SHA256</span><strong>${esc(item.sha256 || "-")}</strong></div>
         <div class="kv"><span>来源</span><strong>${esc(item.origin || "-")}</strong></div>
@@ -2246,7 +2263,7 @@ function sourceArchiveDetailHtml(item) {
   `;
 }
 
-async function uploadSourceArchive(file, productHint) {
+async function uploadSourceArchive(file, productHint, sourceVersion) {
   const response = await fetch("/api/source-archives/upload", {
     method: "POST",
     credentials: "same-origin",
@@ -2254,6 +2271,7 @@ async function uploadSourceArchive(file, productHint) {
       "Content-Type": file.type || "application/octet-stream",
       "x-source-filename": encodeURIComponent(file.name || "source.zip"),
       "x-source-product": encodeURIComponent(productHint || ""),
+      "x-source-version": encodeURIComponent(sourceVersion || ""),
     },
     body: file,
   });
@@ -2271,6 +2289,7 @@ async function uploadSourceArchive(file, productHint) {
 async function loadSourceArchives() {
   const params = new URLSearchParams({ limit: "30", offset: "0" });
   if (state.sourceArchiveQ) params.set("q", state.sourceArchiveQ);
+  if (state.sourceArchiveVersionRole) params.set("version_role", state.sourceArchiveVersionRole);
   const data = await api(`/api/source-archives?${params}`);
   if (!data) return;
   const items = data.data || [];
@@ -2945,6 +2964,11 @@ $("#sourceArchiveQuery").addEventListener("input", (event) => {
 
 $("#sourceArchiveRefresh").addEventListener("click", loadSourceArchives);
 
+$("#sourceArchiveVersionRole").addEventListener("change", (event) => {
+  state.sourceArchiveVersionRole = event.target.value;
+  loadSourceArchives();
+});
+
 $("#sourceArchiveFile").addEventListener("change", updateSourceArchiveFileName);
 
 $("#sourceArchiveUploadForm").addEventListener("submit", async (event) => {
@@ -2959,8 +2983,9 @@ $("#sourceArchiveUploadForm").addEventListener("submit", async (event) => {
   button.disabled = true;
   button.textContent = "上传中";
   try {
-    await uploadSourceArchive(file, $("#sourceArchiveProduct").value.trim());
+    await uploadSourceArchive(file, $("#sourceArchiveProduct").value.trim(), $("#sourceArchiveVersion").value.trim());
     $("#sourceArchiveFile").value = "";
+    $("#sourceArchiveVersion").value = "";
     updateSourceArchiveFileName();
     await Promise.all([loadSourceArchives(), loadMessages()]);
     setTimeout(loadSourceArchives, 5000);

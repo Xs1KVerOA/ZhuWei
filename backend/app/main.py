@@ -372,13 +372,21 @@ async def get_sources(_: None = Depends(require_auth)):
 async def get_source_archives(
     status: str = "",
     q: str = "",
+    version_role: str = "",
     limit: int = 30,
     offset: int = 0,
     _: None = Depends(require_auth),
 ):
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
-    payload = await run_blocking(db.list_source_archives, status=status, query=q, limit=limit, offset=offset)
+    payload = await run_blocking(
+        db.list_source_archives,
+        status=status,
+        query=q,
+        version_role=version_role,
+        limit=limit,
+        offset=offset,
+    )
     payload["data"] = [_public_source_archive(item) for item in payload.get("data", [])]
     return payload
 
@@ -387,6 +395,7 @@ async def get_source_archives(
 async def upload_source_archive(request: Request, _: None = Depends(require_auth)):
     filename = unquote(request.headers.get("x-source-filename") or "source.zip")
     product_hint = unquote(request.headers.get("x-source-product") or "")
+    source_version = unquote(request.headers.get("x-source-version") or "")
     content_type = request.headers.get("content-type") or "application/octet-stream"
     try:
         archive = await create_source_archive_from_stream(
@@ -394,6 +403,7 @@ async def upload_source_archive(request: Request, _: None = Depends(require_auth
             filename=filename,
             content_type=content_type,
             product_hint=product_hint,
+            source_version=source_version,
         )
     except ValueError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc

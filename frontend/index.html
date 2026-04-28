@@ -146,7 +146,14 @@
         <div class="panel-head search-row">
           <h2>源码库</h2>
           <div class="filters">
-            <input id="sourceArchiveQuery" type="search" placeholder="搜索源码包、产品、SHA256" />
+            <input id="sourceArchiveQuery" type="search" placeholder="搜索源码包、产品、版本、SHA256" />
+            <select id="sourceArchiveVersionRole" title="源码版本类型">
+              <option value="">全部版本</option>
+              <option value="affected">受影响版本</option>
+              <option value="latest">最新版本</option>
+              <option value="uploaded">手动上传</option>
+              <option value="unknown">未知版本</option>
+            </select>
             <button id="sourceArchiveRefresh" type="button">刷新</button>
           </div>
         </div>
@@ -157,6 +164,7 @@
             <span id="sourceArchiveFileName" class="source-file-name">未选择文件</span>
           </label>
           <input id="sourceArchiveProduct" type="text" placeholder="产品提示，可留空" />
+          <input id="sourceArchiveVersion" type="text" placeholder="源码版本，可留空" />
           <button id="sourceArchiveUpload" type="submit" class="primary">上传源码</button>
         </form>
         <div class="subhead" id="sourceArchiveCount"></div>

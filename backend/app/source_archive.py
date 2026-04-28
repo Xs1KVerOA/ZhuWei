@@ -86,6 +86,7 @@ async def create_source_archive_from_stream(
     filename: str,
     content_type: str = "application/octet-stream",
     product_hint: str = "",
+    source_version: str = "",
 ) -> dict[str, Any]:
     root = _upload_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -113,6 +114,8 @@ async def create_source_archive_from_stream(
         "content_type": content_type or "application/octet-stream",
         "size_bytes": size,
         "sha256": digest.hexdigest(),
+        "source_version": _clean_source_version(source_version),
+        "version_role": "uploaded",
         "status": "queued",
         "minio_status": "pending",
         "local_path": str(path),
@@ -138,8 +141,6 @@ def register_analysis_source_artifact(vulnerability: dict[str, Any], artifact: d
     if not archive_path.is_file():
         return None
     source_url = str(artifact.get("url") or "").strip()
-    if _is_public_package_registry_url(source_url):
-        return None
     digest, size = _file_digest(archive_path)
     product_hint = _product_hint_from_vulnerability(vulnerability)
     record = db.create_source_archive(
@@ -149,6 +150,8 @@ def register_analysis_source_artifact(vulnerability: dict[str, Any], artifact: d
             "content_type": "application/zip",
             "size_bytes": size,
             "sha256": digest,
+            "source_version": _clean_source_version(artifact.get("source_version") or artifact.get("version")),
+            "version_role": _clean_version_role(artifact.get("version_role") or "affected"),
             "status": "queued",
             "minio_status": "pending",
             "local_path": str(archive_path),
@@ -160,6 +163,9 @@ def register_analysis_source_artifact(vulnerability: dict[str, Any], artifact: d
                 "title": vulnerability.get("title"),
                 "source_url": source_url,
                 "source_title": artifact.get("title"),
+                "source_version": artifact.get("source_version") or artifact.get("version"),
+                "version_role": artifact.get("version_role"),
+                "version_evidence": artifact.get("version_evidence"),
             },
         }
     )
@@ -187,6 +193,8 @@ def process_source_archive_sync(archive_id: int) -> dict[str, Any] | None:
         updated = db.update_source_archive(
             archive_id,
             status="needs_confirmation",
+            source_version=_clean_source_version(archive.get("source_version") or model_result.get("source_version") or ""),
+            version_role=_clean_version_role(archive.get("version_role") or model_result.get("version_role") or ""),
             extracted_path=str(extracted),
             suggested_product_name=str(model_result.get("suggested_product_name") or archive.get("product_hint") or "").strip()[:200],
             suggested_vendor=str(model_result.get("suggested_vendor") or "").strip()[:160],
@@ -645,6 +653,8 @@ def _source_analysis_prompt(archive: dict[str, Any], manifest: dict[str, Any]) -
         "filename": archive.get("filename"),
         "origin": archive.get("origin"),
         "product_hint": archive.get("product_hint"),
+        "source_version": archive.get("source_version"),
+        "version_role": archive.get("version_role"),
         "sha256": archive.get("sha256"),
         "manifest": manifest,
     }
@@ -658,13 +668,16 @@ def _source_analysis_prompt(archive: dict[str, Any], manifest: dict[str, Any]) -
 1. 优先读取 package.json、pyproject.toml、pom.xml、go.mod、Cargo.toml、README、源码入口文件。
 2. 不要进行漏洞利用、红队攻击或外网访问；只做产品归属、架构和功能分析。
 3. 如果产品名不确定，给出最可能的建议名，并在 product_evidence 里说明证据和不确定点。
-4. 最后只输出 JSON，不要 Markdown 围栏。
+4. 尽量从 package.json、pyproject.toml、pom.xml、go.mod、Cargo.toml、composer.json、README、CHANGELOG 或 tag/commit 信息中识别源码版本。
+5. 最后只输出 JSON，不要 Markdown 围栏。
 
 JSON schema:
 {{
   "suggested_product_name": "建议产品名，供用户确认",
   "suggested_vendor": "厂商或组织，可为空",
   "suggested_aliases": ["别名1", "别名2"],
+  "source_version": "源码版本，可为空",
+  "version_role": "uploaded | affected | latest | unknown",
   "architecture_summary": "中文说明源码目录结构、技术栈、入口、核心模块",
   "function_summary": "中文说明该源码实现的业务/组件能力",
   "product_evidence": "从包名、README、命名空间、组织名、文件结构中得到的产品归属证据",
@@ -693,6 +706,8 @@ def _fallback_source_analysis(archive: dict[str, Any], manifest: dict[str, Any])
         "suggested_product_name": product,
         "suggested_vendor": vendor,
         "suggested_aliases": _clean_aliases(aliases),
+        "source_version": _clean_source_version(archive.get("source_version") or package_info.get("version") or ""),
+        "version_role": _clean_version_role(archive.get("version_role") or "uploaded"),
         "architecture_summary": (
             f"已解压 {manifest.get('total_files', 0)} 个可分析文件；主要语言/类型：{language_text}；"
             f"清单文件：{manifest_names}。{extraction_text}"
@@ -738,7 +753,12 @@ def _clean_source_product_result(
 ) -> dict[str, Any]:
     package_info = _package_identity(manifest)
     package_name = str(package_info.get("name") or "").strip()
+    package_version = str(package_info.get("version") or "").strip()
     suggested = str(result.get("suggested_product_name") or "").strip()
+    if not str(result.get("source_version") or "").strip() and package_version:
+        result["source_version"] = package_version
+    result["source_version"] = _clean_source_version(result.get("source_version") or archive.get("source_version") or "")
+    result["version_role"] = _clean_version_role(result.get("version_role") or archive.get("version_role") or "unknown")
     if _is_noisy_source_product(suggested) and package_name:
         result["suggested_product_name"] = package_name
         aliases = _clean_aliases([*(result.get("suggested_aliases") or []), suggested])
@@ -802,18 +822,21 @@ def _package_identity(manifest: dict[str, Any]) -> dict[str, str]:
             if isinstance(payload, dict):
                 return {
                     "name": str(payload.get("name") or "").strip(),
+                    "version": str(payload.get("version") or "").strip(),
                     "description": str(payload.get("description") or "").strip(),
                     "evidence": f"package.json: name={payload.get('name') or ''}, version={payload.get('version') or ''}",
                 }
     for name, text in items:
         if name.endswith("pyproject.toml"):
             match = re.search(r"(?m)^\s*name\s*=\s*[\"']([^\"']+)[\"']", text)
+            version = re.search(r"(?m)^\s*version\s*=\s*[\"']([^\"']+)[\"']", text)
             desc = re.search(r"(?m)^\s*description\s*=\s*[\"']([^\"']+)[\"']", text)
             if match:
                 return {
                     "name": match.group(1).strip(),
+                    "version": version.group(1).strip() if version else "",
                     "description": desc.group(1).strip() if desc else "",
-                    "evidence": f"pyproject.toml: name={match.group(1).strip()}",
+                    "evidence": f"pyproject.toml: name={match.group(1).strip()}, version={version.group(1).strip() if version else ''}",
                 }
     for name, text in items:
         if name.endswith("pom.xml"):
@@ -849,6 +872,7 @@ def _pom_identity(text: str) -> dict[str, str]:
         return {}
     return {
         "name": name,
+        "version": version,
         "description": description,
         "evidence": f"groupId={group_id}, artifactId={artifact_id}, version={version}",
     }
@@ -870,6 +894,7 @@ def _pom_identity_from_text(text: str) -> dict[str, str]:
         return {}
     return {
         "name": name,
+        "version": version,
         "description": description,
         "evidence": f"groupId={group_id}, artifactId={artifact_id}, version={version}",
     }
@@ -1012,6 +1037,29 @@ def _safe_filename(value: str) -> str:
     return text[:180]
 
 
+def _clean_source_version(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n,:;，；")
+    if text.lower() in {"none", "null", "unknown", "n/a", "na", "-"}:
+        return ""
+    return text[:120]
+
+
+def _clean_version_role(value: Any) -> str:
+    text = re.sub(r"[^a-z_]+", "_", str(value or "").strip().lower()).strip("_")
+    mapping = {
+        "vulnerable": "affected",
+        "vulnerability": "affected",
+        "problem": "affected",
+        "fixed": "latest",
+        "current": "latest",
+        "newest": "latest",
+        "upload": "uploaded",
+        "user_upload": "uploaded",
+    }
+    normalized = mapping.get(text, text)
+    return normalized if normalized in {"uploaded", "affected", "latest", "unknown"} else "unknown"
+
+
 def _clean_aliases(values: Any) -> list[str]:
     if isinstance(values, str):
         values = [values]
@@ -1049,21 +1097,6 @@ def _path_is_relative_to(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
-
-
-def _is_public_package_registry_url(url: str) -> bool:
-    lowered = url.lower()
-    return any(
-        marker in lowered
-        for marker in [
-            "npmjs.com/package/",
-            "registry.npmjs.org/",
-            "pypi.org/project/",
-            "files.pythonhosted.org/",
-            "packagist.org/packages/",
-            "rubygems.org/gems/",
-        ]
-    )
 
 
 def run_async(coro: Any) -> Any:

@@ -703,6 +703,8 @@ def init_db() -> None:
                 content_type TEXT NOT NULL DEFAULT '',
                 size_bytes INTEGER NOT NULL DEFAULT 0,
                 sha256 TEXT NOT NULL DEFAULT '',
+                source_version TEXT NOT NULL DEFAULT '',
+                version_role TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'queued',
                 minio_status TEXT NOT NULL DEFAULT 'pending',
                 minio_bucket TEXT NOT NULL DEFAULT '',
@@ -836,6 +838,20 @@ def init_db() -> None:
                 "evidence_type": "TEXT NOT NULL DEFAULT 'direct'",
                 "source_count": "INTEGER NOT NULL DEFAULT 1",
             },
+        )
+        _ensure_columns(
+            conn,
+            "source_archives",
+            {
+                "source_version": "TEXT NOT NULL DEFAULT ''",
+                "version_role": "TEXT NOT NULL DEFAULT ''",
+            },
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_source_archives_version
+            ON source_archives(product_key, source_version, version_role)
+            """
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_vulnerabilities_dedupe ON vulnerabilities(dedupe_key)"
@@ -4203,6 +4219,8 @@ SOURCE_ARCHIVE_UPDATE_COLUMNS = {
     "content_type",
     "size_bytes",
     "sha256",
+    "source_version",
+    "version_role",
     "status",
     "minio_status",
     "minio_bucket",
@@ -4237,7 +4255,8 @@ def create_source_archive(payload: dict[str, Any]) -> dict[str, Any]:
         cursor = conn.execute(
             """
             INSERT INTO source_archives (
-                origin, filename, content_type, size_bytes, sha256, status,
+                origin, filename, content_type, size_bytes, sha256,
+                source_version, version_role, status,
                 minio_status, minio_bucket, minio_object_key, minio_url, minio_error,
                 local_path, extracted_path, product_hint, suggested_product_name,
                 suggested_vendor, suggested_aliases, product_name, product_key,
@@ -4245,7 +4264,7 @@ def create_source_archive(payload: dict[str, Any]) -> dict[str, Any]:
                 product_evidence, analysis_model, analysis_raw, error,
                 created_at, updated_at, analyzed_at, confirmed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.get("origin") or "user_upload",
@@ -4253,6 +4272,8 @@ def create_source_archive(payload: dict[str, Any]) -> dict[str, Any]:
                 payload.get("content_type") or "",
                 int(payload.get("size_bytes") or 0),
                 payload.get("sha256") or "",
+                _clip_text(payload.get("source_version") or "", 120),
+                _clip_text(payload.get("version_role") or "", 32),
                 payload.get("status") or "queued",
                 payload.get("minio_status") or "pending",
                 payload.get("minio_bucket") or "",
@@ -4334,6 +4355,7 @@ def list_source_archives(
     *,
     status: str = "",
     query: str = "",
+    version_role: str = "",
     limit: int = 30,
     offset: int = 0,
 ) -> dict[str, Any]:
@@ -4342,6 +4364,9 @@ def list_source_archives(
     if status:
         clauses.append("status=?")
         args.append(status)
+    if version_role:
+        clauses.append("version_role=?")
+        args.append(version_role)
     if query:
         like = f"%{query}%"
         clauses.append(
@@ -4351,11 +4376,13 @@ def list_source_archives(
                 OR product_hint LIKE ?
                 OR suggested_product_name LIKE ?
                 OR product_name LIKE ?
+                OR source_version LIKE ?
+                OR version_role LIKE ?
                 OR sha256 LIKE ?
             )
             """
         )
-        args.extend([like, like, like, like, like])
+        args.extend([like, like, like, like, like, like, like])
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with connection() as conn:
         total = int(
@@ -4421,6 +4448,8 @@ def confirm_source_archive_product(
                         "origin": archive.get("origin"),
                         "source_archive_id": archive_id,
                         "vendor": vendor,
+                        "source_version": archive.get("source_version"),
+                        "version_role": archive.get("version_role"),
                     },
                 }
             ]
@@ -4464,6 +4493,8 @@ def _deserialize_source_archive(row: dict[str, Any]) -> dict[str, Any]:
     row["analysis_raw"] = _json_value(row.get("analysis_raw"), {})
     row["product_confirmed"] = bool(row.get("product_confirmed"))
     row["size_bytes"] = int(row.get("size_bytes") or 0)
+    row["source_version"] = row.get("source_version") or ""
+    row["version_role"] = row.get("version_role") or ""
     row["minio_ready"] = row.get("minio_status") == "uploaded" and bool(row.get("minio_url"))
     return row
 
