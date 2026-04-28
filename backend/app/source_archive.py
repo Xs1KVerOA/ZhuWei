@@ -18,7 +18,7 @@ from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
 from . import db
-from .claude_code import claude_code_subprocess_env
+from .claude_code import claude_code_subprocess_env, resolve_claude_code_command
 from .config import settings
 from .deepseek import get_deepseek_api_key
 from .minio_store import delete_object, minio_configured, upload_file
@@ -586,7 +586,7 @@ def _source_manifest(root: Path) -> dict[str, Any]:
 
 def _flash_source_analysis(archive: dict[str, Any], root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     fallback = _fallback_source_analysis(archive, manifest)
-    command_path = shutil.which(settings.claude_code_command)
+    command_path = resolve_claude_code_command()
     if not command_path or not get_deepseek_api_key():
         return fallback
     prompt = _source_analysis_prompt(archive, manifest)

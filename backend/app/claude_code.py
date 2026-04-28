@@ -53,11 +53,13 @@ def claude_code_subprocess_env() -> dict[str, str]:
 
 def get_claude_code_status() -> dict[str, Any]:
     current_path = _resolve_claude_command()
+    resolved_path = current_path or str(_status.get("path") or "")
     runtime_env = _claude_code_env()
     return {
         **_status,
-        "available": bool(current_path) or bool(_status.get("available")),
-        "path": _display_path(current_path or _status.get("path", "")),
+        "available": bool(resolved_path) or bool(_status.get("available")),
+        "path": _display_path(resolved_path),
+        "resolved_path": resolved_path,
         "auth_token_configured": bool(get_deepseek_api_key()),
         "install_on_startup": settings.claude_code_install_on_startup,
         "required": settings.claude_code_required,
@@ -217,3 +219,7 @@ def _resolve_claude_command() -> str:
     if local_candidate.is_file():
         return str(local_candidate)
     return ""
+
+
+def resolve_claude_code_command() -> str:
+    return _resolve_claude_command()

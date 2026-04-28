@@ -4,14 +4,13 @@ import asyncio
 import json
 import logging
 import re
-import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from . import db
-from .claude_code import claude_code_subprocess_env, ensure_claude_code
+from .claude_code import claude_code_subprocess_env, ensure_claude_code, resolve_claude_code_command
 from .config import settings
 from .deepseek import get_deepseek_api_key
 
@@ -62,7 +61,7 @@ async def resolve_unmatched_alerts_with_deepseek(*, limit: int = 5) -> dict[str,
         return {"checked": len(candidates), "linked": 0, "empty": 0, "failed": 0}
 
     status = await ensure_claude_code()
-    command_path = shutil.which(settings.claude_code_command) or status.get("path") or ""
+    command_path = resolve_claude_code_command() or str(status.get("resolved_path") or "")
     if not command_path:
         db.create_message(
             level="warning",

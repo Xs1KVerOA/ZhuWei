@@ -15,7 +15,7 @@ from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from . import db, redis_queue
-from .claude_code import claude_code_subprocess_env, ensure_claude_code
+from .claude_code import claude_code_subprocess_env, ensure_claude_code, resolve_claude_code_command
 from .config import settings
 from .deepseek import get_deepseek_api_key
 from .source_archive import register_analysis_source_artifact
@@ -428,9 +428,15 @@ async def _run_analysis(vulnerability_id: int) -> None:
         )
         _check_analysis_canceled(vulnerability_id)
         status = await ensure_claude_code()
-        command_path = shutil.which(settings.claude_code_command) or status.get("path") or ""
+        command_path = resolve_claude_code_command() or str(status.get("resolved_path") or "")
         if not command_path:
             raise AnalysisFailure("分析失败", status.get("error") or "Claude Code CLI is not available")
+        command_path = str(Path(command_path).expanduser())
+        if not Path(command_path).is_file():
+            raise AnalysisFailure(
+                "分析失败",
+                f"Claude Code CLI 路径不存在：{command_path}",
+            )
         if not get_deepseek_api_key():
             raise AnalysisFailure("模型源异常", "DeepSeek API key 未配置，无法调用 DeepSeek 模型源。")
         _check_analysis_canceled(vulnerability_id)
