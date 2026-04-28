@@ -590,6 +590,6 @@ curl -H "Authorization: Bearer <token>" http://127.0.0.1:8010/api/sources
 
 ## 许可证 / License
 
-当前仓库未声明开源许可证。用于课程、内网演示或内部研究前，请先确认项目授权边界。
+本项目基于 MIT License 开源，详见 [LICENSE](LICENSE)。
 
-No open-source license is declared in this repository yet. Confirm the authorization scope before using it for courses, internal demos, or research.
+This project is open-sourced under the MIT License. See [LICENSE](LICENSE) for details.
