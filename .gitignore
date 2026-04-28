@@ -1,0 +1,34 @@
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# Python/runtime
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local runtime state, databases, source uploads, model workspaces and logs
+backend/data/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.pid
+
+# Release/build artifacts and temporary update bundles
+dist/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.update
+
+# Local/system artifacts
+.DS_Store
+capture.pcap

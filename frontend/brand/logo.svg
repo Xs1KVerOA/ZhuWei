@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 168" role="img" aria-labelledby="title desc">
+  <title id="title">烛微 Logo</title>
+  <desc id="desc">烛微的横版品牌标识，包含盾牌、烛焰、雷达扫描和微点洞察图形。</desc>
+  <defs>
+    <linearGradient id="shield" x1="28" y1="16" x2="142" y2="150" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111827"/>
+      <stop offset="0.52" stop-color="#172554"/>
+      <stop offset="1" stop-color="#0F766E"/>
+    </linearGradient>
+    <linearGradient id="flame" x1="70" y1="54" x2="99" y2="125" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FDE68A"/>
+      <stop offset="0.45" stop-color="#F59E0B"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+    <linearGradient id="word" x1="164" y1="48" x2="476" y2="116" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111827"/>
+      <stop offset="0.68" stop-color="#1D4ED8"/>
+      <stop offset="1" stop-color="#0F766E"/>
+    </linearGradient>
+    <filter id="soft-glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="2.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  <path fill="url(#shield)" d="M84 10 143 34v45c0 38.3-22.6 66.2-59 84-36.4-17.8-59-45.7-59-84V34L84 10Z"/>
+  <path fill="none" stroke="#E5E7EB" stroke-opacity="0.24" stroke-width="2.5" d="M84 21 132 40v39c0 31.7-17.8 55-48 70.3C53.8 134 36 110.7 36 79V40l48-19Z"/>
+  <path fill="none" stroke="#38BDF8" stroke-linecap="round" stroke-width="5" d="M46 88a38 38 0 0 1 76 0"/>
+  <path fill="none" stroke="#14B8A6" stroke-linecap="round" stroke-opacity="0.9" stroke-width="4" d="M58 88a26 26 0 0 1 52 0"/>
+  <path fill="url(#flame)" d="M84 53c12 14 20 26 20 42 0 17.5-10.1 28.1-20 36-9.9-7.9-20-18.5-20-36 0-12.9 6.1-23.4 14.8-32.6 2.6-2.8 4.5-5.8 5.2-9.4Z"/>
+  <path fill="#F8FAFC" fill-opacity="0.9" d="M84 76c7.1 8.4 11 15.1 11 24 0 9.4-4.7 15.9-11 21-6.3-5.1-11-11.6-11-21 0-8.9 3.9-15.6 11-24Z"/>
+  <path fill="#111827" fill-opacity="0.72" d="M80 99h8v29h-8z"/>
+  <circle cx="84" cy="95" r="7" fill="#F8FAFC" filter="url(#soft-glow)"/>
+  <circle cx="84" cy="95" r="3.5" fill="#EF4444"/>
+  <circle cx="45" cy="64" r="5" fill="#F59E0B"/>
+  <circle cx="123" cy="64" r="5" fill="#38BDF8"/>
+  <circle cx="58" cy="124" r="5" fill="#14B8A6"/>
+  <circle cx="110" cy="124" r="5" fill="#F59E0B"/>
+  <path fill="none" stroke="#CBD5E1" stroke-linecap="round" stroke-opacity="0.72" stroke-width="2.5" d="M50 65h20M118 65H98M62 120l13-13M106 107l8 13"/>
+  <text x="174" y="76" fill="url(#word)" font-family="Inter, Arial, sans-serif" font-size="46" font-weight="800" letter-spacing="0">烛微</text>
+  <text x="176" y="112" fill="#475569" font-family="Inter, Arial, sans-serif" font-size="17" font-weight="700" letter-spacing="3">ZHUWEI VULN ATLAS</text>
+  <path fill="#F59E0B" d="M176 128h256v6H176z"/>
+  <path fill="#14B8A6" d="M438 128h46v6h-46z"/>
+  <path fill="#EF4444" d="M490 128h20v6h-20z"/>
+</svg>

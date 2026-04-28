@@ -1,0 +1,11 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+apscheduler==3.10.4
+httpx==0.28.1
+beautifulsoup4==4.12.3
+cryptography==44.0.0
+python-dotenv==1.2.2
+playwright>=1.49,<2
+psycopg[binary]>=3.2,<4
+redis>=5,<7
+neo4j>=5,<6

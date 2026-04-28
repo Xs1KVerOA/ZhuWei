@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>烛微 ZhuWei</title>
+    <link rel="icon" href="/brand/logo-mark.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260427-model-picker" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-main">
+        <div class="brand-lockup">
+          <img class="brand-mark" src="/brand/logo-mark.svg" alt="" />
+          <div>
+            <h1>烛微</h1>
+            <p id="jobLine" hidden>调度加载中</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button id="runRegular" class="topbar-run-btn" title="立即抓取每 30 分钟轮询的数据源">30分钟源</button>
+          <button id="runSlow" class="topbar-run-btn" title="立即抓取每天 10:00 和 18:00 轮询的数据源">低频源</button>
+          <button id="logout" class="topbar-run-btn" title="退出">退出</button>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <div class="message-queue">
+          <button id="messageToggle" type="button" class="msg-bell-btn" title="消息队列">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+              <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+            </svg>
+            <span id="messageBadge" class="message-badge" hidden>0</span>
+          </button>
+          <section id="messagePanel" class="message-panel" hidden>
+            <div class="message-head">
+              <strong>消息队列</strong>
+              <button id="markAllMessagesRead" type="button">全部已读</button>
+            </div>
+            <div id="messageList" class="message-list"></div>
+          </section>
+        </div>
+      </div>
+      <nav class="quick-nav" aria-label="后台快捷导航">
+        <a href="#dashboard" data-view-link="dashboard">看板</a>
+        <a href="#alerts" data-view-link="alerts">告警</a>
+        <a href="#products" data-view-link="products">产品</a>
+        <a href="#analysis" data-view-link="analysis">分析</a>
+        <a href="#source" data-view-link="source">源码</a>
+        <a href="#graph" data-view-link="graph">图谱</a>
+        <a href="#updates" data-view-link="updates">更新</a>
+        <a href="#config" data-view-link="config">配置</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="panel dashboard-panel" id="dashboardPanel">
+        <div class="panel-head">
+          <h2>数据看板</h2>
+          <span id="dashboardHint"></span>
+        </div>
+        <div class="metrics" id="metrics"></div>
+        <div class="dashboard-breakdown" id="dashboardBreakdown"></div>
+      </section>
+
+      <section class="panel" id="deepseekPanel">
+        <div class="panel-head">
+          <h2>模型源</h2>
+          <button id="refreshDeepSeek" class="primary" title="刷新余额">刷新余额</button>
+        </div>
+        <div class="settings-grid">
+          <div id="deepseekStatus" class="settings-status"></div>
+          <form id="deepseekForm" class="settings-form model-source-form">
+            <input id="modelBaseUrl" type="url" placeholder="模型 URL，如 https://api.deepseek.com/anthropic" autocomplete="off" />
+            <input id="deepseekKey" type="password" placeholder="API Key，不填写则保留现有密钥" autocomplete="off" />
+            <input id="flashModel" type="text" placeholder="Flash 模型，如 deepseek-v4-flash" autocomplete="off" />
+            <input id="proModel" type="text" placeholder="Pro 模型，如 deepseek-v4-pro[1m]" autocomplete="off" />
+            <button type="submit" class="primary">保存</button>
+            <button id="clearDeepSeek" type="button">清除</button>
+          </form>
+        </div>
+        <div id="deepseekMessage" class="message"></div>
+      </section>
+
+      <section class="panel" id="sessionPanel">
+        <div class="panel-head">
+          <h2>站点会话</h2>
+          <button id="refreshAvdSession" class="primary" title="刷新 AVD Cookie">刷新 AVD</button>
+        </div>
+        <div class="source-session-grid">
+          <div class="source-session">
+            <h3>AVD</h3>
+            <div id="avdSessionStatus" class="settings-status"></div>
+            <div class="session-actions">
+              <button id="runAvdAfterSession" type="button">运行 AVD</button>
+              <button id="clearAvdSession" type="button">清除 Cookie</button>
+            </div>
+          </div>
+          <div class="source-session">
+            <h3>CNVD</h3>
+            <div id="cnvdSessionStatus" class="settings-status"></div>
+            <div class="session-actions">
+              <a class="intel-button active session-link" href="/proxy/browse?source=cnvd" target="_blank" rel="noreferrer">容器浏览器</a>
+              <button id="captureCnvdProxy" class="primary" type="button">保存当前会话</button>
+              <button id="refreshCnvdSession" class="primary" type="button">刷新 CNVD</button>
+              <button id="runCnvdAfterSession" type="button">运行 CNVD</button>
+              <button id="clearCnvdSession" type="button">清除 Cookie</button>
+            </div>
+            <form id="cnvdCookieForm" class="cookie-form">
+              <input id="cnvdCookie" type="password" placeholder="CNVD Cookie" autocomplete="off" />
+              <button type="submit">保存 Cookie</button>
+            </form>
+          </div>
+        </div>
+        <div id="avdSessionMessage" class="message"></div>
+        <div id="cnvdSessionMessage" class="message"></div>
+      </section>
+
+      <section class="panel" id="followedPanel">
+        <div class="panel-head">
+          <h2>关注产品</h2>
+          <span id="followedCount"></span>
+        </div>
+        <div id="followedProducts" class="followed-list"></div>
+      </section>
+
+      <section class="panel" id="productCenter">
+        <div class="panel-head search-row">
+          <h2>产品库</h2>
+          <div class="filters">
+            <input id="productQuery" type="search" placeholder="搜索软件产品" />
+            <button id="productAlign" type="button">对齐漏洞</button>
+            <button id="productNormalize" type="button">规范别名</button>
+            <button id="productToggleList" type="button">展开清单</button>
+          </div>
+        </div>
+        <div class="subhead" id="productCount"></div>
+        <div id="products" class="product-list"></div>
+        <div class="pager" id="productPager" hidden>
+          <button id="productPrev" type="button">上一页</button>
+          <button id="productNext" type="button">下一页</button>
+        </div>
+      </section>
+
+      <section class="panel" id="sourceArchivePanel">
+        <div class="panel-head search-row">
+          <h2>源码库</h2>
+          <div class="filters">
+            <input id="sourceArchiveQuery" type="search" placeholder="搜索源码包、产品、SHA256" />
+            <button id="sourceArchiveRefresh" type="button">刷新</button>
+          </div>
+        </div>
+        <form id="sourceArchiveUploadForm" class="source-upload-form">
+          <input id="sourceArchiveFile" class="source-file-input" type="file" accept=".zip,.tar,.tgz,.tar.gz,.tar.bz2,.tbz2,.gz,.7z,.rar,.json,.txt,.md" />
+          <label class="source-file-picker" for="sourceArchiveFile">
+            <span class="source-file-button">选择源码包</span>
+            <span id="sourceArchiveFileName" class="source-file-name">未选择文件</span>
+          </label>
+          <input id="sourceArchiveProduct" type="text" placeholder="产品提示，可留空" />
+          <button id="sourceArchiveUpload" type="submit" class="primary">上传源码</button>
+        </form>
+        <div class="subhead" id="sourceArchiveCount"></div>
+        <div id="sourceArchives" class="source-archive-list"></div>
+      </section>
+
+      <section class="panel" id="graphPanel">
+        <div class="panel-head">
+          <h2>图谱</h2>
+          <div class="filters">
+            <form id="graphSearchForm" class="graph-search-form">
+              <input id="graphQuery" type="search" placeholder="搜索 CVE、漏洞 ID 或产品名" />
+              <select id="graphKind" title="搜索类型">
+                <option value="auto">自动</option>
+                <option value="vulnerability">漏洞</option>
+                <option value="product">产品</option>
+              </select>
+              <select id="graphDepth" title="关系深度">
+                <option value="1" selected>一跳</option>
+                <option value="2">二跳</option>
+                <option value="3">三跳</option>
+              </select>
+              <button id="graphSearch" type="submit" class="primary">查询</button>
+            </form>
+            <button id="graphSync" type="button">同步图谱</button>
+            <a class="topbar-run-btn graph-browser-link" href="http://127.0.0.1:7474" target="_blank" rel="noreferrer">Neo4j Browser</a>
+          </div>
+        </div>
+        <div id="graphStatus" class="graph-status"></div>
+        <div id="graphSyncMessage" class="message"></div>
+        <div class="graph-workbench">
+          <div class="graph-canvas-shell">
+            <div class="graph-target-bar">
+              <div id="graphTarget" class="graph-target">输入 CVE、漏洞 ID 或产品名后查询关系图</div>
+              <div class="graph-view-controls" aria-label="图谱视图控制">
+                <button id="graphZoomOut" type="button" title="缩小" aria-label="缩小">-</button>
+                <span id="graphZoomLabel">100%</span>
+                <button id="graphZoomIn" type="button" title="放大" aria-label="放大">+</button>
+                <button id="graphZoomFit" type="button" title="适配视图" aria-label="适配视图">[]</button>
+                <button id="graphZoomReset" type="button" title="重置视图" aria-label="重置视图">1:1</button>
+              </div>
+            </div>
+            <div id="graphCanvas" class="graph-canvas">
+              <div class="empty">图谱数据已就绪；查询后会展示漏洞、产品、告警、数据源和源码证据链。</div>
+            </div>
+            <div id="graphLegend" class="graph-legend"></div>
+          </div>
+          <aside id="graphInspector" class="graph-inspector">
+            <h3>节点详情</h3>
+            <div class="empty inline">选择图中的节点查看属性。</div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="panel" id="updatePanel">
+        <div class="panel-head search-row">
+          <h2>热更新</h2>
+          <div class="filters">
+            <button id="updateRefresh" type="button">刷新</button>
+          </div>
+        </div>
+        <form id="updateUploadForm" class="source-upload-form update-upload-form">
+          <input id="updateFile" class="source-file-input" type="file" accept=".update" />
+          <label class="source-file-picker" for="updateFile">
+            <span class="source-file-button">选择更新包</span>
+            <span id="updateFileName" class="source-file-name">未选择文件</span>
+          </label>
+          <button id="updateUpload" type="submit" class="primary">上传并分析</button>
+        </form>
+        <div class="subhead" id="updateCount"></div>
+        <div id="updates" class="source-archive-list"></div>
+      </section>
+
+      <section class="panel" id="analysisCenter">
+        <div class="panel-head search-row">
+          <h2>漏洞分析</h2>
+          <div class="filters">
+            <input id="analysisQuery" type="search" placeholder="CVE、产品、标题" />
+            <button id="analysisRefresh" type="button">刷新</button>
+          </div>
+        </div>
+        <div class="subhead" id="analysisCount"></div>
+        <div class="analysis-board">
+          <section class="analysis-column">
+            <div class="analysis-column-head">
+              <h3>排队中</h3>
+              <span id="analysisQueuedCount">0</span>
+            </div>
+            <div id="analysisQueued" class="analysis-list"></div>
+          </section>
+          <section class="analysis-column">
+            <div class="analysis-column-head">
+              <h3>正在分析</h3>
+              <span id="analysisRunningCount">0</span>
+            </div>
+            <div id="analysisRunning" class="analysis-list"></div>
+          </section>
+          <section class="analysis-column">
+            <div class="analysis-column-head">
+              <h3>已分析</h3>
+              <span id="analysisFinishedCount">0</span>
+            </div>
+            <div id="analysisFinished" class="analysis-list"></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="panel" id="rulesPanel">
+        <div class="panel-head">
+          <h2>告警规则</h2>
+          <span id="rulesMessage"></span>
+        </div>
+        <form id="rulesForm" class="rules-form">
+          <label>
+            <span>最低等级</span>
+            <select id="minSeverity">
+              <option value="critical">critical</option>
+              <option value="high">high</option>
+              <option value="medium">medium</option>
+              <option value="low">low</option>
+              <option value="unknown">unknown</option>
+            </select>
+          </label>
+          <label class="checkline">
+            <input id="enableCveDedup" type="checkbox" />
+            <span>CVE 去重</span>
+          </label>
+          <label class="checkline">
+            <input id="noFilter" type="checkbox" />
+            <span>跳过关键词</span>
+          </label>
+          <label>
+            <span>告警窗口</span>
+            <input id="maxAlertAgeDays" type="number" min="1" max="3650" value="30" />
+          </label>
+          <label>
+            <span>白名单关键词</span>
+            <textarea id="whiteKeywords" rows="3" placeholder="一行一个；为空则按等级过滤"></textarea>
+          </label>
+          <label>
+            <span>黑名单关键词</span>
+            <textarea id="blackKeywords" rows="3" placeholder="一行一个；命中后不告警"></textarea>
+          </label>
+          <button type="submit" class="primary">保存规则</button>
+        </form>
+      </section>
+
+      <section class="panel" id="alertCenter">
+        <div class="panel-head search-row">
+          <h2>告警中心</h2>
+          <div class="filters">
+            <input id="alertQuery" type="search" placeholder="CVE、产品、标题" />
+            <select id="alertStatus">
+              <option value="new">待处理</option>
+              <option value="acknowledged">已确认</option>
+              <option value="">全部</option>
+            </select>
+            <select id="alertSource">
+              <option value="">全部来源</option>
+            </select>
+            <button id="alertToggleList" type="button">展开清单</button>
+          </div>
+        </div>
+        <div class="subhead" id="alertCount"></div>
+        <div id="alerts" class="alert-list"></div>
+        <div class="pager" id="alertPager" hidden>
+          <button id="alertPrev" type="button">上一页</button>
+          <span id="alertPageInfo">1 / 1 页</span>
+          <input id="alertPageJump" type="number" min="1" value="1" aria-label="跳转页码" />
+          <button id="alertPageGo" type="button">跳转</button>
+          <button id="alertNext" type="button">下一页</button>
+        </div>
+      </section>
+
+      <section class="panel" id="sourcesPanel">
+        <div class="panel-head">
+          <h2>数据源</h2>
+          <span id="sourceCount"></span>
+        </div>
+        <div class="subhead" id="sourceScheduleHint"></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>名称</th>
+                <th>类别</th>
+                <th>计划</th>
+                <th>最近状态</th>
+                <th>最近数量</th>
+                <th>最近运行</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="sources"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel" id="vulnCenter">
+        <div class="panel-head search-row">
+          <h2>漏洞情报</h2>
+          <div class="filters">
+            <input id="query" type="search" placeholder="CVE、标题、产品" />
+            <select id="severity">
+              <option value="">全部等级</option>
+              <option value="critical">critical</option>
+              <option value="high">high</option>
+              <option value="medium">medium</option>
+              <option value="low">low</option>
+              <option value="unknown">unknown</option>
+            </select>
+            <button id="vulnToggleList" type="button">展开清单</button>
+          </div>
+        </div>
+        <div class="subhead" id="vulnCount"></div>
+        <div id="vulns" class="vuln-list"></div>
+        <div class="pager" id="vulnPager" hidden>
+          <button id="vulnPrev" type="button">上一页</button>
+          <button id="vulnNext" type="button">下一页</button>
+        </div>
+      </section>
+    </main>
+
+    <button id="dashboardJump" class="dashboard-jump" type="button" title="回到数据看板" aria-label="回到数据看板" hidden>
+      ↑ 数据看板
+    </button>
+
+    <div id="intelModal" class="modal" hidden>
+      <div class="modal-backdrop" data-close-intel></div>
+      <section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="intelModalTitle">
+        <div class="panel-head">
+          <h2 id="intelModalTitle">情报详情</h2>
+          <button type="button" data-close-intel>关闭</button>
+        </div>
+        <div class="modal-body">
+          <div id="intelModalBody" class="modal-content plain"></div>
+        </div>
+      </section>
+    </div>
+
+    <script src="/assets/app.js?v=20260427-model-picker"></script>
+  </body>
+</html>
