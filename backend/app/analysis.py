@@ -2714,11 +2714,12 @@ def _parse_claude_output(stdout_text: str, workspace: Path | None = None) -> dic
             inner = _json_from_text(result)
             if isinstance(inner, dict) and ("summary" in inner or "poc_available" in inner or "exp_available" in inner):
                 return inner
+            if workspace_result:
+                workspace_result["_preferred_over_stdout"] = "workspace_structured_result"
+                return workspace_result
             narrative = _analysis_payload_from_result_text(result, outer)
             if narrative:
                 return narrative
-            if workspace_result:
-                return workspace_result
         if all(key in outer for key in ["summary", "poc_available", "exp_available"]):
             return outer
         if "summary" in outer:
@@ -2731,11 +2732,12 @@ def _parse_claude_output(stdout_text: str, workspace: Path | None = None) -> dic
                     inner = _json_from_text(result)
                     if isinstance(inner, dict):
                         return inner
+                    if workspace_result:
+                        workspace_result["_preferred_over_stdout"] = "workspace_structured_result"
+                        return workspace_result
                     narrative = _analysis_payload_from_result_text(result, item)
                     if narrative:
                         return narrative
-                    if workspace_result:
-                        return workspace_result
     fallback = _json_from_text(stdout_text.strip())
     if isinstance(fallback, dict) and "summary" in fallback:
         return fallback

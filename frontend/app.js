@@ -32,7 +32,7 @@ const state = {
 const OVERVIEW_LIMIT = 10;
 const LIST_LIMIT = 30;
 const ALERT_PAGE_LIMIT = 10;
-const FRONTEND_BUILD_VERSION = "20260429-agent-evidence";
+const FRONTEND_BUILD_VERSION = "20260429-agent-evidence-v3";
 const intelDetails = new Map();
 let analysisRefreshTimer = null;
 
@@ -2785,36 +2785,109 @@ function analysisEvidenceList(items, emptyText = "暂无记录") {
   `;
 }
 
+function analysisArray(value) {
+  if (Array.isArray(value)) return value.filter(Boolean);
+  if (value && typeof value === "object") return [value];
+  const text = String(value || "").trim();
+  if (!text) return [];
+  return text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+}
+
+function analysisEvidenceCards(items, emptyText = "暂无证据", options = {}) {
+  const values = analysisArray(items);
+  const limit = options.limit || 12;
+  if (!values.length) return `<div class="empty inline">${esc(emptyText)}</div>`;
+  return `
+    <div class="evidence-card-list">
+      ${values.slice(0, limit).map((item) => {
+        if (item && typeof item === "object") {
+          const title = item.title || item.name || item.component || item.component_name || item.repository || item.url || item.local_path || "证据";
+          const href = item.url || item.evidence_url || "";
+          const label = href
+            ? `<a href="${esc(href)}" target="_blank" rel="noreferrer">${esc(title)}</a>`
+            : `<strong>${esc(title)}</strong>`;
+          const tags = [
+            item.kind || item.artifact_kind || "",
+            item.version_role || item.version || item.version_range || "",
+            item.validation || item.status || item.match_status || "",
+            item.priority ? `优先级 ${item.priority}` : "",
+            item.confidence !== undefined ? `置信度 ${Math.round(Number(item.confidence || 0) * 100)}%` : "",
+          ].filter(Boolean);
+          const evidence = item.evidence || item.reason || item.snippet || item.local_path || "";
+          return `
+            <article class="evidence-card">
+              <div>
+                ${label}
+                ${tags.length ? `<small>${tags.map((tag) => esc(tag)).join(" · ")}</small>` : ""}
+              </div>
+              ${evidence ? `<p>${esc(textPreview(evidence, options.preview || 420))}</p>` : ""}
+            </article>
+          `;
+        }
+        return `<article class="evidence-card"><strong>${esc(String(item))}</strong></article>`;
+      }).join("")}
+    </div>
+  `;
+}
+
 function analysisEvidenceChain(item) {
   const output = analysisOutput(item);
   const localFirst = output.local_source_first || {};
   const impacts = item.component_impacts?.length ? item.component_impacts : (output.affected_components || []);
   const diff = item.latest_source_diff_analysis || output.source_diff_analysis || {};
   const diffChanges = diff.key_function_changes || diff.fix_points || [];
+  const sourceRefs = output.source_repositories?.length ? output.source_repositories : (item.analysis_sources || []);
+  const publicEvidence = output.public_poc_exp || [];
+  const rootEvidence = [
+    output.root_cause ? { title: "根因定位", evidence: output.root_cause, validation: "source-audited" } : null,
+    output.source_analysis ? { title: "源码审计结论", evidence: output.source_analysis, validation: "local-source" } : null,
+    output.attack_surface ? { title: "入口点与触发面", evidence: output.attack_surface, validation: "entrypoint" } : null,
+  ].filter(Boolean);
   const localHitValue = localFirst.local_source_hits !== undefined
     ? Number(localFirst.local_source_hits || 0)
-    : (item.analysis_source_found ? 1 : 0);
-  const localRows = [
-    ["模式", localFirst.mode || "enterprise_local_source_first"],
-    ["检索顺序", Array.isArray(localFirst.search_order) ? localFirst.search_order.join(" → ") : ""],
-    ["本地源码命中", localHitValue ? "是" : "否"],
-    ["依赖库命中", localFirst.dependency_hits ?? ""],
-  ].filter((row) => row[1] !== "" && row[1] !== undefined && row[1] !== null);
+    : (sourceRefs.length || (item.analysis_source_found ? 1 : 0));
+  const sourceOrder = Array.isArray(localFirst.search_order) ? localFirst.search_order.join(" → ") : "existing_local_source → public_advisory";
+  const metrics = [
+    ["本地源码", localHitValue ? `${localHitValue} 命中` : "未命中"],
+    ["组件展开", impacts.length ? `${impacts.length} 条` : "待生成"],
+    ["公开 POC/EXP", publicEvidence.length ? `${publicEvidence.length} 条` : "待补充"],
+    ["Diff", diff.summary || diff.diff_summary ? "已生成" : "待生成"],
+  ];
   return `
-    <div class="analysis-evidence">
-      <div class="source-detail-grid">
-        ${localRows.map(([label, value]) => `<div class="kv"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}
+    <div class="analysis-evidence evidence-chain">
+      <div class="evidence-hero">
+        <div>
+          <span>AI Agent 源码证据链</span>
+          <strong>${esc(localFirst.mode || "enterprise_local_source_first")}</strong>
+          <p>${esc(localFirst.evidence || `检索顺序：${sourceOrder}`)}</p>
+        </div>
+        <div class="evidence-metric-strip">
+          ${metrics.map(([label, value]) => `<div><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}
+        </div>
       </div>
-      ${localFirst.evidence ? `<p class="analysis-note">${esc(localFirst.evidence)}</p>` : ""}
-      <div class="analysis-evidence-block">
-        <h4>影响组件自动展开</h4>
-        ${analysisEvidenceList(impacts, "暂无组件命中记录；可重新分析或刷新组件影响。")}
-      </div>
-      <div class="analysis-evidence-block">
-        <h4>源码版本 Diff</h4>
-        ${diff.summary || diff.diff_summary ? `<pre>${esc(diff.summary || diff.diff_summary)}</pre>` : `<div class="empty inline">暂无 Diff 记录；上传 affected/fixed/latest 中任意两个源码后可通过后台 API 生成。</div>`}
-        ${analysisEvidenceList(diffChanges, "暂无关键函数变化记录")}
-        ${diff.bypass_risk ? `<p class="analysis-note">${esc(diff.bypass_risk)}</p>` : ""}
+      <div class="evidence-section-grid">
+        <div class="evidence-section">
+          <h4>本地源码命中</h4>
+          ${analysisEvidenceCards(sourceRefs, "暂无本地源码记录", { preview: 300 })}
+        </div>
+        <div class="evidence-section">
+          <h4>公开 POC / EXP 证据</h4>
+          ${analysisEvidenceCards(publicEvidence, "暂无公开 POC/EXP 证据", { preview: 360 })}
+        </div>
+        <div class="evidence-section wide">
+          <h4>源码根因证据</h4>
+          ${analysisEvidenceCards(rootEvidence, "暂无源码根因证据", { preview: 520, limit: 6 })}
+        </div>
+        <div class="evidence-section">
+          <h4>影响组件自动展开</h4>
+          ${analysisEvidenceCards(impacts, "暂无组件命中记录；可重新分析或刷新组件影响。", { preview: 360 })}
+        </div>
+        <div class="evidence-section">
+          <h4>源码版本 Diff</h4>
+          ${diff.summary || diff.diff_summary ? `<pre>${esc(diff.summary || diff.diff_summary)}</pre>` : `<div class="empty inline">暂无 Diff 记录；上传 affected/fixed/latest 中任意两个源码后可通过后台 API 生成。</div>`}
+          ${analysisEvidenceCards(diffChanges, "暂无关键函数变化记录", { preview: 260, limit: 8 })}
+          ${diff.bypass_risk ? `<p class="analysis-note">${esc(diff.bypass_risk)}</p>` : ""}
+        </div>
       </div>
     </div>
   `;
@@ -2826,28 +2899,105 @@ function redTeamWorkbenchHtml(item) {
   if (!workbench || !Object.keys(workbench).length) {
     return `<div class="empty inline">暂无红队验证工作台记录；重新分析会生成环境、版本、入口点、参数和失败原因模板。</div>`;
   }
-  const rows = [
-    ["环境搭建提示", workbench.environment_setup],
-    ["版本确认", workbench.version_confirmation],
-    ["入口点确认", workbench.entrypoints],
-    ["请求参数分析", workbench.request_parameters],
-    ["POC 前置条件", workbench.poc_prerequisites],
-    ["利用链阶段图", workbench.exploit_chain],
-    ["失败原因记录", workbench.failure_notes],
+  const cards = [
+    ["环境", workbench.environment_setup],
+    ["版本", workbench.version_confirmation],
+    ["入口点", workbench.entrypoints],
+    ["参数", workbench.request_parameters],
+    ["前置条件", workbench.poc_prerequisites],
   ];
+  const chain = analysisArray(workbench.exploit_chain);
+  const failures = analysisArray(workbench.failure_notes);
   return `
     <div class="redteam-workbench">
-      ${rows.map(([label, values]) => `
-        <div class="analysis-evidence-block">
-          <h4>${esc(label)}</h4>
-          ${analysisEvidenceList(values, "暂无记录")}
+      <div class="workbench-hero">
+        <div>
+          <span>红队验证工作台</span>
+          <strong>${esc(output.exp_type || workbench.status || "ready")}</strong>
+          <p>${esc(textPreview(workbench.reproduction_report || "验证证据已就绪", 150))}</p>
         </div>
-      `).join("")}
-      <div class="analysis-evidence-block">
+        <div class="workbench-stats">
+          <div><span>入口点</span><strong>${esc(analysisArray(workbench.entrypoints).length || "-")}</strong></div>
+          <div><span>链路阶段</span><strong>${esc(chain.length || "-")}</strong></div>
+          <div><span>失败记录</span><strong>${esc(failures.length || "-")}</strong></div>
+        </div>
+      </div>
+      <div class="workbench-card-grid">
+        ${cards.map(([label, values]) => `
+          <article class="workbench-card">
+            <h4>${esc(label)}</h4>
+            ${analysisEvidenceList(values, "暂无记录")}
+          </article>
+        `).join("")}
+      </div>
+      <div class="workbench-chain">
+        <h4>利用链阶段图</h4>
+        ${chain.length ? `
+          <ol>
+            ${chain.map((step, index) => `<li><span>${index + 1}</span><p>${esc(String(step))}</p></li>`).join("")}
+          </ol>
+        ` : `<div class="empty inline">暂无链路阶段</div>`}
+      </div>
+      <div class="workbench-report-grid">
+        <article class="workbench-card">
+          <h4>失败原因记录</h4>
+          ${analysisEvidenceList(failures, "暂无失败记录")}
+        </article>
+        <article class="workbench-card report">
         <h4>复现报告</h4>
         <pre>${esc(analysisText(workbench.reproduction_report, "暂无复现报告"))}</pre>
+        </article>
       </div>
     </div>
+  `;
+}
+
+function analysisArtifactCandidates(output, kind) {
+  const keys = kind === "poc"
+    ? ["public_poc_exp", "poc_candidates", "poc_references", "poc_repositories", "poc_sources"]
+    : ["public_poc_exp", "exp_candidates", "exp_references", "exp_repositories", "exploit_repositories", "exploit_sources"];
+  const values = [];
+  keys.forEach((key) => {
+    const list = analysisArray(output[key]);
+    list.forEach((entry) => {
+      if (!entry || typeof entry !== "object") {
+        values.push(entry);
+        return;
+      }
+      const entryKind = String(entry.kind || key).toLowerCase();
+      if (kind === "poc" && entryKind.includes("exp") && !entryKind.includes("poc")) return;
+      if (kind === "exp" && !(entryKind.includes("exp") || entryKind.includes("exploit") || entryKind.includes("poc_exp"))) return;
+      values.push(entry);
+    });
+  });
+  return values;
+}
+
+function analysisArtifactPanel(item, kind, label, logButton) {
+  const output = analysisOutput(item);
+  const available = Boolean(item[`${kind}_available`] || output[`${kind}_available`]);
+  const content = item[`${kind}_content`] || output[`${kind}_content`] || output[kind] || "";
+  const url = item[`${kind}_url`] || output[`${kind}_url`] || "";
+  const validation = output[`${kind}_validation`] || {};
+  const validationText = validation && typeof validation === "object"
+    ? [validation.status || "", validation.evidence || ""].filter(Boolean).join("：")
+    : String(validation || "");
+  const candidates = analysisArtifactCandidates(output, kind);
+  return `
+    <div class="analysis-panel-tools">
+      <span>${esc(label)} ${available || content || url ? "已生成" : "未生成"}</span>
+      ${logButton}
+    </div>
+    ${validationText ? `<p class="analysis-note">${esc(validationText)}</p>` : ""}
+    <pre>${esc(analysisText(content, available ? `标记存在 ${label}，但暂无正文。` : `暂无 ${label}`))}</pre>
+    ${url ? `<a href="${esc(url)}" target="_blank" rel="noreferrer">打开 ${esc(label)} 链接</a>` : ""}
+    ${candidates.length ? `
+      <div class="artifact-evidence">
+        <h4>${esc(label)} 证据</h4>
+        ${analysisEvidenceCards(candidates, `暂无 ${label} 证据`, { preview: 420 })}
+      </div>
+    ` : ""}
+    ${githubEvidencePanel(item, kind)}
   `;
 }
 
@@ -2893,16 +3043,10 @@ function analysisTabs(item) {
         ${redTeamWorkbenchHtml(item)}
       </section>
       <section data-analysis-panel="poc" hidden>
-        <div class="analysis-panel-tools">${logButton}</div>
-        <pre>${esc(analysisText(item.poc_content || output.poc_content || output.poc, item.poc_available ? "标记存在 POC，但暂无正文。" : "暂无 POC"))}</pre>
-        ${item.poc_url ? `<a href="${esc(item.poc_url)}" target="_blank" rel="noreferrer">打开 POC 链接</a>` : ""}
-        ${githubEvidencePanel(item, "poc")}
+        ${analysisArtifactPanel(item, "poc", "POC", logButton)}
       </section>
       <section data-analysis-panel="exp" hidden>
-        <div class="analysis-panel-tools">${logButton}</div>
-        <pre>${esc(analysisText(item.exp_content || output.exp_content || output.exp, item.exp_available ? "标记存在 EXP，但暂无正文。" : "暂无 EXP"))}</pre>
-        ${item.exp_url ? `<a href="${esc(item.exp_url)}" target="_blank" rel="noreferrer">打开 EXP 链接</a>` : ""}
-        ${githubEvidencePanel(item, "exp")}
+        ${analysisArtifactPanel(item, "exp", "EXP", logButton)}
       </section>
       <section data-analysis-panel="fix" hidden>
         <div class="analysis-panel-tools">${logButton}</div>

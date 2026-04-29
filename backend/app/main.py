@@ -83,7 +83,7 @@ from .update_manager import (
 
 
 logger = logging.getLogger("zhuwei")
-FRONTEND_BUILD_VERSION = "20260429-agent-evidence"
+FRONTEND_BUILD_VERSION = "20260429-agent-evidence-v3"
 app = FastAPI(title="烛微 ZhuWei")
 
 

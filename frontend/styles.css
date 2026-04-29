@@ -2355,6 +2355,189 @@ a.analysis-source-pill:hover {
   font-size: 14px;
 }
 
+.evidence-chain {
+  display: grid;
+  gap: 12px;
+}
+
+.evidence-hero,
+.workbench-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(220px, 0.8fr);
+  gap: 12px;
+  align-items: stretch;
+  border: 1px solid #bfdbfe;
+  border-radius: 6px;
+  background: linear-gradient(135deg, #f8fbff 0%, #f0fdfa 100%);
+  padding: 12px;
+}
+
+.evidence-hero span,
+.workbench-hero span {
+  display: block;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.evidence-hero strong,
+.workbench-hero strong {
+  display: block;
+  margin-top: 4px;
+  color: #0f172a;
+  font-size: 18px;
+  line-height: 1.25;
+}
+
+.evidence-hero p,
+.workbench-hero p {
+  margin: 8px 0 0;
+  color: #334155;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.evidence-metric-strip,
+.workbench-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.evidence-metric-strip div,
+.workbench-stats div {
+  border: 1px solid #dbeafe;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.76);
+  padding: 8px;
+}
+
+.evidence-metric-strip strong,
+.workbench-stats strong {
+  margin-top: 2px;
+  font-size: 16px;
+}
+
+.evidence-section-grid,
+.workbench-card-grid,
+.workbench-report-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.evidence-section,
+.workbench-card {
+  min-width: 0;
+  border: 1px solid #dbe3ef;
+  border-radius: 6px;
+  background: #fff;
+  padding: 10px;
+}
+
+.evidence-section.wide,
+.workbench-card.report {
+  grid-column: 1 / -1;
+}
+
+.evidence-card-list {
+  display: grid;
+  gap: 8px;
+}
+
+.evidence-card {
+  display: grid;
+  gap: 5px;
+  border-left: 3px solid #2563eb;
+  border-radius: 4px;
+  background: #f8fafc;
+  padding: 8px 9px;
+}
+
+.evidence-card strong,
+.evidence-card a {
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.evidence-card a:hover {
+  color: var(--blue);
+}
+
+.evidence-card small {
+  display: block;
+  margin-top: 3px;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.evidence-card p {
+  margin: 0;
+  color: #334155;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.redteam-workbench {
+  display: grid;
+  gap: 12px;
+}
+
+.workbench-card-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.workbench-chain {
+  border: 1px solid #dbe3ef;
+  border-radius: 6px;
+  background: #fff;
+  padding: 10px;
+}
+
+.workbench-chain ol {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workbench-chain li {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.workbench-chain li > span {
+  width: 28px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  background: #e0f2fe;
+  color: #0369a1;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.workbench-chain p {
+  margin: 0;
+  border-left: 2px solid #bae6fd;
+  padding: 2px 0 8px 10px;
+  color: #334155;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.artifact-evidence {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 .analysis-note {
   margin: 10px 0 0;
   color: #344054;
@@ -2439,6 +2622,26 @@ a.analysis-source-pill:hover {
   font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.workbench-card.report pre,
+.evidence-section pre {
+  max-height: 340px;
+}
+
+@media (max-width: 900px) {
+  .evidence-hero,
+  .workbench-hero,
+  .evidence-section-grid,
+  .workbench-card-grid,
+  .workbench-report-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .evidence-metric-strip,
+  .workbench-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .analysis-feedback {
