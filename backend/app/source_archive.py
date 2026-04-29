@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import uuid
 from collections.abc import AsyncIterable
@@ -27,6 +28,7 @@ from .minio_store import delete_object, minio_configured, upload_file
 logger = logging.getLogger(__name__)
 
 SOURCE_ARCHIVE_WORKERS = 2
+LATEST_FETCH_TIMEOUT_SECONDS = 600
 EXTRACT_NOTE_FILE = ".zhuwei_extract_notes.json"
 SKIP_DIRS = {
     ".git",
@@ -78,6 +80,8 @@ def start_source_archive_workers() -> None:
             if status == "analyzing":
                 db.update_source_archive(int(row["id"]), status="queued", error="服务重启后恢复源码分析任务。")
             schedule_source_archive_processing(int(row["id"]))
+    for row in db.list_source_archives(status="fetching", limit=50, offset=0).get("data", []):
+        _executor.submit(fetch_latest_source_archive_sync, int(row["id"]))
 
 
 async def create_source_archive_from_stream(
@@ -177,6 +181,163 @@ def schedule_source_archive_processing(archive_id: int) -> None:
     _executor.submit(process_source_archive_sync, archive_id)
 
 
+def create_latest_source_archive_request(
+    *,
+    product_name: str = "",
+    product_key_value: str = "",
+    repo_url: str = "",
+) -> dict[str, Any]:
+    product_key_value = str(product_key_value or "").strip()
+    repo_url = _clean_repo_url(repo_url)
+    product_detail = db.get_product_detail(product_key_value) if product_key_value else None
+    product_name = str(product_name or "").strip() or str((product_detail or {}).get("name") or "").strip()
+    aliases = [
+        str(item.get("alias") or "").strip()
+        for item in ((product_detail or {}).get("aliases") or [])
+        if isinstance(item, dict) and str(item.get("alias") or "").strip()
+    ]
+    labels = _latest_fetch_product_labels(product_name, aliases)
+    if not labels and not repo_url:
+        raise ValueError("请先填写产品名，或提供源码仓库 URL。")
+    existing = _existing_latest_source_archive(labels, product_key_value)
+    if existing:
+        db.create_message(
+            level="info",
+            category="source_archive",
+            title="最新版本源码已存在",
+            body=f"{existing.get('filename') or product_name}\n源码库中已有该产品的最新版本源码或拉取任务，本次不会重复拉取。",
+            entity_type="source_archive",
+            entity_id=existing.get("id"),
+            raw={"source_archive_id": existing.get("id"), "product": product_name, "dedupe": True},
+        )
+        return existing
+    product_key = str(
+        (product_detail or {}).get("canonical_product_key")
+        or (product_detail or {}).get("product_key")
+        or product_key_value
+        or ""
+    )
+    confirmed = bool(product_detail and product_key)
+    display_name = product_name or labels[0] if labels else "source"
+    safe_name = _safe_filename(display_name) or "source"
+    archive = db.create_source_archive(
+        {
+            "origin": "latest_fetch",
+            "filename": f"{safe_name}-latest.pending",
+            "content_type": "application/octet-stream",
+            "size_bytes": 0,
+            "sha256": "",
+            "source_version": "",
+            "version_role": "latest",
+            "status": "fetching",
+            "minio_status": "pending",
+            "local_path": "",
+            "product_hint": product_name,
+            "suggested_product_name": product_name,
+            "product_name": product_name if confirmed else "",
+            "product_key": product_key if confirmed else "",
+            "product_confirmed": confirmed,
+            "analysis_raw": {
+                "fetch_request": {
+                    "product_name": product_name,
+                    "product_key": product_key,
+                    "product_labels": labels,
+                    "repo_url": repo_url,
+                }
+            },
+        }
+    )
+    _executor.submit(fetch_latest_source_archive_sync, int(archive["id"]))
+    db.create_message(
+        level="info",
+        category="source_archive",
+        title="最新版本源码拉取已排队",
+        body=f"{product_name or repo_url}\n正在从源码库入口拉取最新版本源码，完成后会自动进入结构分析与 MinIO 上传流程。",
+        entity_type="source_archive",
+        entity_id=archive["id"],
+        raw={"source_archive_id": archive["id"], "product": product_name, "repo_url": repo_url},
+    )
+    return archive
+
+
+def fetch_latest_source_archive_sync(archive_id: int) -> dict[str, Any] | None:
+    archive = db.get_source_archive(archive_id)
+    if not archive:
+        return None
+    raw = archive.get("analysis_raw") if isinstance(archive.get("analysis_raw"), dict) else {}
+    request = raw.get("fetch_request") if isinstance(raw.get("fetch_request"), dict) else {}
+    product_name = str(request.get("product_name") or archive.get("product_hint") or archive.get("suggested_product_name") or "").strip()
+    labels = [
+        str(item or "").strip()
+        for item in (request.get("product_labels") if isinstance(request.get("product_labels"), list) else [])
+        if str(item or "").strip()
+    ]
+    if product_name and product_name not in labels:
+        labels.insert(0, product_name)
+    repo_url = _clean_repo_url(str(request.get("repo_url") or ""))
+    db.update_source_archive(archive_id, status="fetching", error="正在拉取最新版本源码。")
+    try:
+        artifact = _fetch_latest_source_artifact(labels or [product_name], repo_url, archive_id)
+        path = Path(str(artifact["path"]))
+        digest, size = _file_digest(path)
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        updated = db.update_source_archive(
+            archive_id,
+            filename=path.name,
+            content_type=str(artifact.get("content_type") or _content_type_for_source_path(path)),
+            size_bytes=size,
+            sha256=digest,
+            source_version=_clean_source_version(artifact.get("source_version") or ""),
+            version_role="latest",
+            status="queued",
+            minio_status="pending",
+            minio_error="",
+            local_path=str(path),
+            error="",
+            analysis_raw={
+                **raw,
+                "fetch_request": request,
+                "fetch_result": {
+                    "strategy": artifact.get("strategy"),
+                    "package": artifact.get("package"),
+                    "repo_url": artifact.get("repo_url") or repo_url,
+                    "source_version": artifact.get("source_version") or "",
+                    "local_path": str(path),
+                    "completed_at": now,
+                },
+            },
+        )
+        db.create_message(
+            level="success",
+            category="source_archive",
+            title="最新版本源码拉取完成",
+            body=f"{path.name}\n已拉取最新版本源码，接下来进入源码结构分析、MinIO 上传和产品确认流程。",
+            entity_type="source_archive",
+            entity_id=archive_id,
+            raw={"source_archive_id": archive_id, "path": str(path), "strategy": artifact.get("strategy")},
+        )
+        schedule_source_archive_processing(archive_id)
+        return updated
+    except Exception as exc:
+        logger.warning("latest source fetch failed: %s", archive_id, exc_info=True)
+        updated = db.update_source_archive(
+            archive_id,
+            status="failed",
+            error=str(exc)[:4000],
+            analyzed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+        db.create_message(
+            level="error",
+            category="source_archive",
+            title="最新版本源码拉取失败",
+            body=f"{product_name or repo_url or archive.get('filename')}\n{str(exc)[:500]}",
+            entity_type="source_archive",
+            entity_id=archive_id,
+            raw={"source_archive_id": archive_id, "error": str(exc)[:1000]},
+        )
+        return updated
+
+
 def process_source_archive_sync(archive_id: int) -> dict[str, Any] | None:
     archive = db.get_source_archive(archive_id)
     if not archive:
@@ -262,6 +423,329 @@ def delete_source_archive(
     deleted["delete_reason"] = reason or ("取消入库并删除源码。" if require_unconfirmed else "删除源码。")
     deleted["cleanup"] = cleanup
     return deleted
+
+
+def _existing_latest_source_archive(labels: list[str], product_key_value: str = "") -> dict[str, Any] | None:
+    statuses = {"fetching", "queued", "analyzing", "needs_confirmation", "ready"}
+    candidates: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for label in labels[:8]:
+        for row in db.list_source_archives(query=label, version_role="latest", limit=20, offset=0).get("data", []):
+            archive_id = int(row.get("id") or 0)
+            if archive_id and archive_id not in seen:
+                seen.add(archive_id)
+                candidates.append(row)
+    if product_key_value:
+        for row in db.list_source_archives(version_role="latest", limit=100, offset=0).get("data", []):
+            archive_id = int(row.get("id") or 0)
+            if archive_id and archive_id not in seen and str(row.get("product_key") or "") == product_key_value:
+                seen.add(archive_id)
+                candidates.append(row)
+    normalized_labels = {_simple_product_norm(label) for label in labels if _simple_product_norm(label)}
+    for row in candidates:
+        if str(row.get("status") or "") not in statuses:
+            continue
+        if product_key_value and str(row.get("product_key") or "") == product_key_value:
+            return row
+        archive_names = [
+            row.get("product_name"),
+            row.get("suggested_product_name"),
+            row.get("product_hint"),
+            row.get("filename"),
+        ]
+        archive_norms = {_simple_product_norm(str(value or "")) for value in archive_names if str(value or "").strip()}
+        if any(a == b or (a and b and (a in b or b in a)) for a in archive_norms for b in normalized_labels):
+            return row
+    return None
+
+
+def _fetch_latest_source_artifact(labels: list[str], repo_url: str, archive_id: int) -> dict[str, Any]:
+    fetch_root = _upload_root() / "latest_fetch" / str(archive_id)
+    if fetch_root.exists():
+        shutil.rmtree(fetch_root)
+    fetch_root.mkdir(parents=True, exist_ok=True)
+    if repo_url:
+        return _fetch_latest_from_git(repo_url, fetch_root, labels[0] if labels else "source")
+    errors: list[str] = []
+    candidates = _package_candidates_from_labels(labels)
+    for candidate in candidates:
+        ecosystem = candidate.get("ecosystem") or ""
+        package = candidate.get("package") or ""
+        strategies = ["pypi", "npm"] if ecosystem == "auto" else [ecosystem]
+        for strategy in strategies:
+            try:
+                if strategy == "pypi":
+                    return _fetch_latest_from_pypi(package, fetch_root)
+                if strategy == "npm":
+                    return _fetch_latest_from_npm(package, fetch_root)
+            except Exception as exc:
+                errors.append(f"{strategy}:{package}: {str(exc)[:300]}")
+    if not candidates:
+        errors.append("未从产品名中识别到可用于 PyPI/npm 的包名。")
+    raise ValueError("无法拉取最新版本源码；" + "；".join(errors[:5]))
+
+
+def _fetch_latest_from_git(repo_url: str, fetch_root: Path, product_name: str) -> dict[str, Any]:
+    git = shutil.which("git")
+    if not git:
+        raise ValueError("本机未找到 git，无法拉取源码仓库。")
+    repo_name = _safe_filename(Path(repo_url.rstrip("/").split("/")[-1].removesuffix(".git")).name or product_name) or "source"
+    clone_dir = fetch_root / repo_name
+    _run_fetch_command([git, "clone", "--depth", "1", repo_url, str(clone_dir)], fetch_root)
+    source_version = _manifest_source_version(clone_dir) or _git_head_revision(clone_dir)
+    output_base = _upload_root() / f"{uuid.uuid4().hex}-{repo_name}-latest"
+    archive_path = Path(shutil.make_archive(str(output_base), "zip", root_dir=fetch_root, base_dir=clone_dir.name))
+    shutil.rmtree(fetch_root, ignore_errors=True)
+    return {
+        "path": archive_path,
+        "content_type": "application/zip",
+        "source_version": source_version,
+        "strategy": "git",
+        "repo_url": repo_url,
+    }
+
+
+def _fetch_latest_from_pypi(package: str, fetch_root: Path) -> dict[str, Any]:
+    attempts = [
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "download",
+            package,
+            "--no-deps",
+            "--no-binary=:all:",
+            "-d",
+            str(fetch_root),
+        ],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "download",
+            package,
+            "--no-deps",
+            "-d",
+            str(fetch_root),
+        ],
+    ]
+    errors: list[str] = []
+    before = set(fetch_root.iterdir())
+    for command in attempts:
+        try:
+            _run_fetch_command(command, fetch_root)
+            path = _newest_source_package(fetch_root, before)
+            if path:
+                return {
+                    "path": path,
+                    "content_type": _content_type_for_source_path(path),
+                    "source_version": _version_from_archive_filename(path.name, package),
+                    "strategy": "pypi",
+                    "package": package,
+                }
+        except Exception as exc:
+            errors.append(str(exc)[:300])
+    raise ValueError("PyPI 拉取失败：" + "；".join(errors[:2]))
+
+
+def _fetch_latest_from_npm(package: str, fetch_root: Path) -> dict[str, Any]:
+    npm = shutil.which("npm")
+    if not npm:
+        raise ValueError("本机未找到 npm，无法拉取 npm 源码包。")
+    before = set(fetch_root.iterdir())
+    _run_fetch_command([npm, "pack", f"{package}@latest", "--json"], fetch_root)
+    path = _newest_source_package(fetch_root, before)
+    if not path:
+        raise ValueError("npm pack 未生成源码包。")
+    return {
+        "path": path,
+        "content_type": _content_type_for_source_path(path),
+        "source_version": _version_from_archive_filename(path.name, package),
+        "strategy": "npm",
+        "package": package,
+    }
+
+
+def _run_fetch_command(command: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        command,
+        cwd=str(cwd),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=LATEST_FETCH_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if completed.returncode != 0:
+        output = (completed.stderr or completed.stdout or "").strip()
+        raise ValueError(output[:1000] or f"命令退出码 {completed.returncode}")
+    return completed
+
+
+def _newest_source_package(root: Path, before: set[Path] | None = None) -> Path | None:
+    before = before or set()
+    candidates = [
+        path
+        for path in root.iterdir()
+        if path.is_file() and path not in before and _content_type_for_source_path(path) != "application/octet-stream"
+    ]
+    if not candidates:
+        candidates = [path for path in root.iterdir() if path.is_file() and _is_source_download(path)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _is_source_download(path: Path) -> bool:
+    lower = path.name.lower()
+    return lower.endswith((".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".whl"))
+
+
+def _content_type_for_source_path(path: Path) -> str:
+    lower = path.name.lower()
+    if lower.endswith(".zip"):
+        return "application/zip"
+    if lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".tar")):
+        return "application/gzip"
+    if lower.endswith(".whl"):
+        return "application/x-wheel+zip"
+    return "application/octet-stream"
+
+
+def _version_from_archive_filename(filename: str, package: str = "") -> str:
+    name = str(filename or "")
+    lower = name.lower()
+    for suffix in [".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".zip", ".whl", ".tar"]:
+        if lower.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    if filename.lower().endswith(".whl"):
+        parts = name.split("-")
+        if len(parts) >= 2:
+            return _clean_source_version(parts[1])
+    package_norm = _simple_product_norm(package)
+    name_norm = _simple_product_norm(name)
+    if package_norm and name_norm.startswith(package_norm):
+        remainder = name[len(package) :].lstrip("-_.")
+        return _clean_source_version(remainder.split("-")[0].split("_")[0])
+    match = re.search(r"(\d+(?:[._-]\d+){1,}(?:[A-Za-z0-9._+-]*)?)", name)
+    return _clean_source_version(match.group(1).replace("_", ".") if match else "")
+
+
+def _manifest_source_version(root: Path) -> str:
+    package_json = root / "package.json"
+    if package_json.is_file():
+        try:
+            payload = json.loads(package_json.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(payload, dict):
+                return _clean_source_version(payload.get("version") or "")
+        except (OSError, json.JSONDecodeError):
+            pass
+    pyproject = root / "pyproject.toml"
+    if pyproject.is_file():
+        text = _read_text_preview(pyproject, 4000)
+        match = re.search(r"(?m)^\s*version\s*=\s*[\"']([^\"']+)[\"']", text)
+        if match:
+            return _clean_source_version(match.group(1))
+    setup_py = root / "setup.py"
+    if setup_py.is_file():
+        text = _read_text_preview(setup_py, 4000)
+        match = re.search(r"version\s*=\s*[\"']([^\"']+)[\"']", text)
+        if match:
+            return _clean_source_version(match.group(1))
+    return ""
+
+
+def _git_head_revision(root: Path) -> str:
+    git = shutil.which("git")
+    if not git:
+        return ""
+    try:
+        completed = subprocess.run(
+            [git, "rev-parse", "--short", "HEAD"],
+            cwd=str(root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
+    except Exception:
+        return ""
+    return _clean_source_version(f"git:{completed.stdout.strip()}") if completed.returncode == 0 else ""
+
+
+def _latest_fetch_product_labels(product_name: str, aliases: list[str]) -> list[str]:
+    values = [product_name, *aliases]
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        label = str(value or "").strip()
+        key = label.lower()
+        if not label or key in seen:
+            continue
+        seen.add(key)
+        result.append(label)
+    return result[:12]
+
+
+def _package_candidates_from_labels(labels: list[str]) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for label in labels:
+        ecosystem, package = _package_candidate_from_product(label)
+        if not package:
+            continue
+        key = (ecosystem, package.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({"ecosystem": ecosystem, "package": package})
+    return candidates[:8]
+
+
+def _package_candidate_from_product(label: str) -> tuple[str, str]:
+    text = str(label or "").strip()
+    if not text:
+        return "auto", ""
+    purl = re.search(r"pkg:(pypi|npm)/([^@\s]+)", text, flags=re.I)
+    if purl:
+        return purl.group(1).lower(), purl.group(2).strip()
+    prefixed = re.match(r"^\s*(pypi|pip|python|npm|node)\s*[:：]\s*(.+?)\s*$", text, flags=re.I)
+    if prefixed:
+        ecosystem = "npm" if prefixed.group(1).lower() in {"npm", "node"} else "pypi"
+        return ecosystem, _clean_package_name(prefixed.group(2), ecosystem)
+    text = re.split(r"\s*[>＞/|]\s*", text)[-1]
+    text = re.sub(r"(?i)\bcve-\d{4}-\d{4,}\b", " ", text)
+    text = re.sub(r"(?i)\b(vulnerability|security|advisory|漏洞|安全|高危|严重)\b", " ", text)
+    tokens = re.findall(r"@?[A-Za-z0-9][A-Za-z0-9_.@+/-]{1,}", text)
+    tokens = [token.strip("-_.") for token in tokens if token.strip("-_.")]
+    if not tokens:
+        return "auto", ""
+    token = tokens[-1] if len(tokens) > 1 else tokens[0]
+    return "auto", _clean_package_name(token, "auto")
+
+
+def _clean_package_name(value: str, ecosystem: str) -> str:
+    text = str(value or "").strip().strip("'\"")
+    text = re.sub(r"\s+", "-", text)
+    text = re.sub(r"[^A-Za-z0-9_.@+/-]+", "", text).strip("-_.")
+    if ecosystem != "npm" and not text.startswith("@"):
+        text = text.lower()
+    return text[:160]
+
+
+def _clean_repo_url(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.match(r"^(https?://|git@)[^\s]+$", text, flags=re.I):
+        return text
+    return ""
+
+
+def _simple_product_norm(value: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").strip().lower())
 
 
 def _upload_to_minio(archive: dict[str, Any], *, force: bool = False) -> None:

@@ -32,10 +32,15 @@ const state = {
 const OVERVIEW_LIMIT = 10;
 const LIST_LIMIT = 30;
 const ALERT_PAGE_LIMIT = 10;
+const FRONTEND_BUILD_VERSION = "20260428-analysis-source";
 const intelDetails = new Map();
 let analysisRefreshTimer = null;
 
 const $ = (selector) => document.querySelector(selector);
+
+function loginRedirectUrl() {
+  return `/login?next=${encodeURIComponent(`/app${location.hash || ""}`)}&v=${FRONTEND_BUILD_VERSION}`;
+}
 
 const VIEW_PANELS = {
   dashboard: ["dashboardPanel"],
@@ -71,7 +76,7 @@ async function api(path, options = {}) {
     ...options,
   });
   if (response.status === 401) {
-    location.href = "/login?next=/app";
+    location.href = loginRedirectUrl();
     return null;
   }
   if (!response.ok) {
@@ -108,6 +113,7 @@ function setActiveView(view, options = {}) {
   if (options.updateHash && location.hash !== `#${next}`) {
     history.replaceState(null, "", `#${next}`);
   }
+  updateDashboardJump();
 }
 
 async function loadActiveView() {
@@ -156,6 +162,31 @@ function formatTime(value) {
     minute: "2-digit",
     hourCycle: "h23",
   }).format(date);
+}
+
+function durationSince(value) {
+  if (!value) return "-";
+  const started = new Date(value).getTime();
+  if (!started || Number.isNaN(started)) return "-";
+  const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} 小时 ${minutes % 60} 分`;
+}
+
+function relativeTime(value) {
+  if (!value) return "-";
+  const time = new Date(value).getTime();
+  if (!time || Number.isNaN(time)) return "-";
+  const seconds = Math.max(0, Math.floor((Date.now() - time) / 1000));
+  if (seconds < 60) return "刚刚";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  return formatTime(value);
 }
 
 function balanceLabel(balance) {
@@ -270,6 +301,7 @@ function initPanelControls() {
       });
       button.textContent = zoomed ? "还原" : "放大";
       document.body.classList.toggle("panel-is-zoomed", Boolean(document.querySelector(".panel.panel-zoomed")));
+      updateDashboardJump();
     });
   });
 }
@@ -277,18 +309,28 @@ function initPanelControls() {
 function initDashboardJump() {
   const button = $("#dashboardJump");
   if (!button) return;
-  const update = () => {
-    button.hidden = window.scrollY < 420;
-  };
   button.addEventListener("click", () => {
-    const target = $("#dashboardPanel");
-    if (target) {
-      target.scrollIntoView({ behavior: "smooth", block: "start" });
-      history.replaceState(null, "", "#dashboardPanel");
+    const zoomed = document.querySelector(".panel.panel-zoomed");
+    if (zoomed) {
+      zoomed.scrollTo({ top: 0, behavior: "smooth" });
+      return;
+    }
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    if (VIEW_PANELS[state.activeView] && location.hash !== `#${state.activeView}`) {
+      history.replaceState(null, "", `#${state.activeView}`);
     }
   });
-  window.addEventListener("scroll", update, { passive: true });
-  update();
+  window.addEventListener("scroll", updateDashboardJump, { passive: true });
+  document.addEventListener("scroll", updateDashboardJump, { passive: true, capture: true });
+  updateDashboardJump();
+}
+
+function updateDashboardJump() {
+  const button = $("#dashboardJump");
+  if (!button) return;
+  const zoomed = document.querySelector(".panel.panel-zoomed");
+  const offset = zoomed ? zoomed.scrollTop : window.scrollY;
+  button.hidden = offset < 420;
 }
 
 function bindAckButtons() {
@@ -298,6 +340,18 @@ function bindAckButtons() {
     button.addEventListener("click", async () => {
       button.disabled = true;
       await api(`/api/alerts/${button.dataset.ack}/ack`, { method: "POST" });
+      await Promise.all([loadAlerts(), loadSummary()]);
+    });
+  });
+}
+
+function bindReadButtons() {
+  document.querySelectorAll("[data-read]").forEach((button) => {
+    if (button.dataset.bound) return;
+    button.dataset.bound = "1";
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      await api(`/api/alerts/${button.dataset.read}/read`, { method: "POST" });
       await Promise.all([loadAlerts(), loadSummary()]);
     });
   });
@@ -845,12 +899,33 @@ function sourceJobHint(jobs = []) {
   ].filter(Boolean).join(" · ");
 }
 
+function alertWorkflowLabel(status) {
+  const labels = {
+    new: "新告警",
+    read: "已读",
+    acknowledged: "已确认",
+  };
+  return labels[status || "new"] || status || "新告警";
+}
+
+function alertWorkflowActions(alert) {
+  const id = esc(alert.alert_id);
+  const status = alert.alert_status || "new";
+  if (status === "acknowledged") {
+    return `<button type="button" disabled>已确认</button>`;
+  }
+  const readButton = status === "new" ? `<button type="button" data-read="${id}">已读</button>` : "";
+  return `${readButton}<button type="button" data-ack="${id}">确认</button>`;
+}
+
 function alertMarkup(alert) {
   const item = alert.vulnerability || {};
+  const workflow = alert.alert_status || "new";
   return `
     <article class="alert ${severityClass(item.severity)}">
       <div>
         <span class="badge ${severityClass(item.severity)}">${esc(item.severity || "unknown")}</span>
+        <span class="alert-status ${esc(workflow)}">${esc(alertWorkflowLabel(workflow))}</span>
         <div class="source-chip">${esc(sourceLabel(item.source))}</div>
         <div class="meta">${esc(alert.reason || "")}</div>
       </div>
@@ -860,7 +935,7 @@ function alertMarkup(alert) {
         <div class="meta">${esc(item.source || "")} · ${esc(item.published_at || item.updated_at || "")} · ${esc(item.cve_id || alert.dedupe_key)}</div>
         ${intelActions(item)}
       </div>
-      ${itemActionButtons(item, `<button type="button" data-ack="${alert.alert_id}">确认</button>`)}
+      ${itemActionButtons(item, alertWorkflowActions(alert))}
     </article>
   `;
 }
@@ -904,7 +979,8 @@ async function loadSummary() {
     ["分析中", data.analysis_running, "Claude Code"],
     ["排队分析", data.analysis_queued, "等待执行"],
     ["已分析", data.analysis_finished, "完成报告"],
-    ["待确认告警", data.open_alerts, "告警中心"],
+    ["新告警", data.new_alerts || 0, "待处理"],
+    ["已读告警", data.read_alerts || 0, "待确认"],
     ["已确认告警", data.acknowledged_alerts, "人工确认"],
     ["POC", data.poc_available, "已有内容"],
     ["EXP", data.exp_available, "已有内容"],
@@ -1921,7 +1997,7 @@ function bindSourceArchiveButtons() {
     if (button.dataset.bound) return;
     button.dataset.bound = "1";
     button.addEventListener("click", async () => {
-      if (!confirm("确认取消入库并删除该源码？这会删除源码库记录、本地源码文件，并尝试删除 MinIO 对象。")) {
+      if (!confirm("确认取消入库并删除该源码？这会删除源码库记录、本地源码文件，并尝试删除对象存储里的源码包。")) {
         return;
       }
       button.disabled = true;
@@ -1943,7 +2019,7 @@ function bindSourceArchiveButtons() {
     if (button.dataset.bound) return;
     button.dataset.bound = "1";
     button.addEventListener("click", async () => {
-      if (!confirm("确认删除该源码？这会删除源码库记录、本地源码文件，并尝试删除 MinIO 对象；已确认的产品不会自动删除。")) {
+      if (!confirm("确认删除该源码？这会删除源码库记录、本地源码文件，并尝试删除对象存储里的源码包；已确认的产品不会自动删除。")) {
         return;
       }
       button.disabled = true;
@@ -2018,9 +2094,37 @@ function bindSourceArchiveButtons() {
         await api(`/api/source-archives/${button.dataset.sourceRetryMinio}/retry-minio`, { method: "POST" });
         await loadSourceArchives();
       } catch (error) {
-        showModal("MinIO 上传失败", error.message);
+        showModal("源码包上传失败", error.message);
       } finally {
         button.disabled = false;
+      }
+    });
+  });
+
+  document.querySelectorAll("[data-source-fetch-latest]").forEach((button) => {
+    if (button.dataset.bound) return;
+    button.dataset.bound = "1";
+    button.addEventListener("click", async () => {
+      const productName = button.dataset.sourceFetchLatest || "";
+      if (!productName) {
+        showModal("拉取失败", "请先确认产品名。");
+        return;
+      }
+      button.disabled = true;
+      const original = button.textContent;
+      button.textContent = "拉取中";
+      try {
+        await fetchLatestSourceArchive({
+          productName,
+          productKey: button.dataset.sourceFetchProductKey || "",
+        });
+        await Promise.all([loadSourceArchives(), loadMessages(), loadSummary()]);
+        setTimeout(loadSourceArchives, 5000);
+      } catch (error) {
+        showModal("拉取失败", error.message);
+      } finally {
+        button.disabled = false;
+        button.textContent = original;
       }
     });
   });
@@ -2117,6 +2221,7 @@ async function loadProducts() {
 
 function sourceArchiveStatusLabel(value) {
   const labels = {
+    fetching: "拉取中",
     queued: "排队中",
     analyzing: "分析中",
     needs_confirmation: "待确认产品",
@@ -2154,8 +2259,11 @@ function sourceArchiveMarkup(item) {
   const productName = item.product_name || item.suggested_product_name || item.product_hint || "";
   const minioClass = item.minio_status === "uploaded" ? "found" : item.minio_status === "failed" ? "missing" : "pending";
   const minioAction = item.minio_download_url
-    ? `<a class="intel-button active" href="${esc(item.minio_download_url)}" target="_blank" rel="noreferrer">MinIO</a>`
-    : `<button type="button" class="intel-button" data-source-retry-minio="${esc(item.id)}">重试 MinIO</button>`;
+    ? `<a class="intel-button active" href="${esc(item.minio_download_url)}" target="_blank" rel="noreferrer" title="通过后端代理下载源码包">下载</a>`
+    : `<button type="button" class="intel-button" data-source-retry-minio="${esc(item.id)}">重试上传</button>`;
+  const fetchLatestAction = productName
+    ? `<button type="button" class="intel-button" data-source-fetch-latest="${esc(productName)}" data-source-fetch-product-key="${esc(item.product_key || "")}">拉取最新版本</button>`
+    : "";
   return `
     <article class="source-archive-item ${esc(item.status || "")}">
       <div class="source-archive-head">
@@ -2169,7 +2277,7 @@ function sourceArchiveMarkup(item) {
         </div>
         <div class="source-archive-badges">
           <span class="analysis-status ${esc(item.status || "")}">${esc(sourceArchiveStatusLabel(item.status))}</span>
-          <span class="analysis-source-pill ${esc(minioClass)}">MinIO ${esc(minioStatusLabel(item.minio_status))}</span>
+          <span class="analysis-source-pill ${esc(minioClass)}">源码包 ${esc(minioStatusLabel(item.minio_status))}</span>
         </div>
       </div>
       <div class="source-archive-summary">
@@ -2185,6 +2293,7 @@ function sourceArchiveMarkup(item) {
       <div class="source-archive-actions">
         <button type="button" class="intel-button active" data-source-detail="${esc(item.id)}">查看详情</button>
         ${minioAction}
+        ${fetchLatestAction}
         <button type="button" class="intel-button active" data-source-reanalyze="${esc(item.id)}">重新分析</button>
         ${item.product_confirmed ? `<button type="button" class="intel-button danger" data-source-delete="${esc(item.id)}">删除源码</button>` : ""}
       </div>
@@ -2208,13 +2317,13 @@ function sourceArchiveDetailHtml(item) {
   const sampleFiles = manifest.sample_files || [];
   const manifestNames = Object.keys(manifest.manifests || {});
   const minio = item.minio_download_url
-    ? `<a href="${esc(item.minio_download_url)}" target="_blank" rel="noreferrer">${esc(item.minio_object_key || "下载源码包")}</a>`
+    ? `<a href="${esc(item.minio_download_url)}" target="_blank" rel="noreferrer">下载源码包</a>`
     : `<span>${esc(item.minio_error || minioStatusLabel(item.minio_status))}</span>`;
   return `
     <div class="source-detail">
       <div class="source-detail-grid">
         <div class="kv"><span>状态</span><strong>${esc(sourceArchiveStatusLabel(item.status))}</strong></div>
-        <div class="kv"><span>MinIO</span><strong>${esc(minioStatusLabel(item.minio_status))}</strong></div>
+        <div class="kv"><span>源码包</span><strong>${esc(minioStatusLabel(item.minio_status))}</strong></div>
         <div class="kv"><span>源码版本</span><strong>${esc(item.source_version || "-")}</strong></div>
         <div class="kv"><span>版本类型</span><strong>${esc(sourceVersionLabel(item))}</strong></div>
         <div class="kv"><span>大小</span><strong>${esc(bytesLabel(item.size_bytes))}</strong></div>
@@ -2256,7 +2365,7 @@ function sourceArchiveDetailHtml(item) {
         <ul class="detail-list">
           <li><span>本地包</span><small>${esc(item.local_path || "-")}</small></li>
           <li><span>解压目录</span><small>${esc(item.extracted_path || "-")}</small></li>
-          <li>${minio}<small>对象存储</small></li>
+          <li>${minio}<small>后端代理下载</small></li>
         </ul>
       </section>
     </div>
@@ -2276,7 +2385,7 @@ async function uploadSourceArchive(file, productHint, sourceVersion) {
     body: file,
   });
   if (response.status === 401) {
-    location.href = "/login?next=/app";
+    location.href = loginRedirectUrl();
     return null;
   }
   if (!response.ok) {
@@ -2284,6 +2393,17 @@ async function uploadSourceArchive(file, productHint, sourceVersion) {
     throw new Error(text || response.statusText);
   }
   return response.json();
+}
+
+async function fetchLatestSourceArchive({ productName = "", productKey = "", repoUrl = "" } = {}) {
+  return api("/api/source-archives/fetch-latest", {
+    method: "POST",
+    body: JSON.stringify({
+      product_name: productName,
+      product_key: productKey,
+      repo_url: repoUrl,
+    }),
+  });
 }
 
 async function loadSourceArchives() {
@@ -2296,6 +2416,7 @@ async function loadSourceArchives() {
   const counts = data.counts || {};
   $("#sourceArchiveCount").textContent = [
     `${items.length} / ${data.total || 0} 个源码包`,
+    counts.fetching ? `拉取中 ${counts.fetching}` : "",
     counts.needs_confirmation ? `待确认 ${counts.needs_confirmation}` : "",
     counts.analyzing ? `分析中 ${counts.analyzing}` : "",
     counts.failed ? `失败 ${counts.failed}` : "",
@@ -2397,7 +2518,7 @@ async function uploadUpdate(file) {
     body: file,
   });
   if (response.status === 401) {
-    location.href = "/login?next=/app";
+    location.href = loginRedirectUrl();
     return null;
   }
   if (!response.ok) {
@@ -2472,6 +2593,15 @@ function analysisModelDisplay(item) {
   return `${label} · ${model}`;
 }
 
+function analysisModelPolicyNote(item) {
+  const raw = item.analysis_raw || {};
+  if (raw.task_model_policy !== "flash_for_light_tasks") return "";
+  const light = raw.light_task_model || "";
+  const deep = raw.deep_task_model || "";
+  if (!light && !deep) return "";
+  return `轻任务 ${light || "-"} · 深度分析 ${deep || "-"}`;
+}
+
 function inferAnalysisModelChoice(model) {
   const lower = String(model || "").toLowerCase();
   if (lower.includes("flash") || lower.includes("haiku")) return "flash";
@@ -2482,12 +2612,14 @@ function inferAnalysisModelChoice(model) {
 function analysisItemMeta(item) {
   const sourceState = analysisSourceState(item);
   const modelLabel = analysisModelDisplay(item);
+  const modelPolicy = analysisModelPolicyNote(item);
   return [
     item.cve_id || "",
     item.product || "",
     item.source || "",
     sourceState.showInMeta ? sourceState.label : "",
     modelLabel ? `模型 ${modelLabel}` : "",
+    modelPolicy,
     item.analysis_trigger ? `触发 ${item.analysis_trigger}` : "",
   ].filter(Boolean).join(" · ");
 }
@@ -2544,10 +2676,28 @@ function analysisEventsText(events) {
         ? `\n  tokens: input=${usage.input_tokens || 0} cache_create=${usage.cache_creation_input_tokens || 0} cache_read=${usage.cache_read_input_tokens || 0} output=${usage.output_tokens || 0}`
         : "";
       const models = raw.json_event?.model_usage_keys?.length ? `\n  models: ${raw.json_event.model_usage_keys.join(", ")}` : "";
-      const result = raw.json_event?.result_preview ? `\n  result: ${raw.json_event.result_preview}` : "";
-      return `[${formatTime(event.created_at)}] ${event.stream || "stage"}: ${event.message}${usageText}${models}${result}`;
+      const result = raw.json_event?.result_preview ? `\n  result: ${textPreview(raw.json_event.result_preview, 500)}` : "";
+      return `[${formatTime(event.created_at)}] ${event.stream || "stage"}: ${textPreview(event.message, 500)}${usageText}${models}${result}`;
     }).join("\n\n")
-    : "等待 Claude Code 输出过程信息。";
+    : "等待模型输出过程信息。";
+}
+
+function analysisRunProgress(item) {
+  const events = [...(item.analysis_events || [])].sort((left, right) => {
+    const leftTime = new Date(left.created_at || 0).getTime() || 0;
+    const rightTime = new Date(right.created_at || 0).getTime() || 0;
+    return rightTime - leftTime || Number(right.id || 0) - Number(left.id || 0);
+  });
+  const newest = events[0] || {};
+  const runId = item.analysis_run_id ? String(item.analysis_run_id).slice(0, 8) : "";
+  const started = item.analysis_started_at || item.analysis_requested_at || "";
+  const parts = [
+    started ? `本轮 ${formatTime(started)} 启动` : "",
+    started ? `已运行 ${durationSince(started)}` : "",
+    newest.created_at ? `最近日志 ${relativeTime(newest.created_at)}` : "等待模型输出",
+    runId ? `run ${runId}` : "",
+  ].filter(Boolean);
+  return `<div class="analysis-progress">${esc(parts.join(" · "))}</div>`;
 }
 
 function analysisLogButton(item, label = "模型日志") {
@@ -2688,6 +2838,7 @@ function analysisCard(item, mode = "finished") {
       <div class="meta">${esc(analysisItemMeta(item))}</div>
       <div class="meta">${esc(formatTime(time))}</div>
       ${item.analysis_error ? `<div class="analysis-error-text">${esc(item.analysis_error)}</div>` : ""}
+      ${mode === "running" ? analysisRunProgress(item) : ""}
       ${mode === "running" ? analysisEventsMarkup(item) : ""}
       ${mode === "finished" ? analysisTabs(item) : ""}
       ${mode === "finished" ? `<button type="button" class="analysis-delete" data-analysis-delete-id="${esc(item.id)}">删除分析</button>` : ""}
@@ -2762,13 +2913,14 @@ async function loadSources() {
     .map((source) => {
       const displayStatus = source.display_status || source.last_status || "pending";
       const displayError = source.display_error ?? source.last_error ?? "";
+      const displayErrorPreview = textPreview(displayError, 160);
       const statusClass = displayStatus === "success" ? "success" : displayStatus === "failed" ? "failed" : displayStatus === "disabled" ? "disabled" : "";
       return `
         <tr>
           <td><strong>${esc(source.title)}</strong><br><span class="meta">${esc(source.name)}</span></td>
           <td><span class="badge ${esc(source.category)}">${esc(source.category)}</span></td>
           <td>${esc(source.schedule)}</td>
-          <td><span class="badge ${statusClass}">${esc(displayStatus)}</span>${displayError ? `<br><span class="meta">${esc(displayError)}</span>` : ""}</td>
+          <td><span class="badge ${statusClass}">${esc(displayStatus)}</span>${displayError ? `<br><span class="meta" title="${esc(displayError)}">${esc(displayErrorPreview)}</span>` : ""}</td>
           <td>${source.last_item_count ?? 0}</td>
           <td>${formatTime(source.last_run_at)}</td>
           <td><button class="primary" data-run="${esc(source.name)}" ${source.enabled ? "" : "disabled"}>${source.enabled ? "运行" : "已停用"}</button></td>
@@ -2825,16 +2977,21 @@ async function loadAlerts() {
   if (state.alertSource) params.set("source", state.alertSource);
   const data = await api(`/api/alerts?${params}`);
   if (!data) return;
-  const statusLabel = state.alertStatus === "new" ? "待处理" : state.alertStatus === "acknowledged" ? "已确认" : "全部";
+  const statusLabel = state.alertStatus ? alertWorkflowLabel(state.alertStatus) : "全部";
   const sourceText = state.alertSource ? sourceLabel(state.alertSource) : "";
   const prefix = [statusLabel, sourceText, state.alertQ ? "搜索结果" : ""].filter(Boolean).join(" · ");
   const label = state.alertExpanded
     ? `${prefix}：${rangeLabel(offset, data.data.length, data.total)}`
     : `${prefix}：最新 ${Math.min(data.data.length, OVERVIEW_LIMIT)} / ${data.total} 条告警`;
   $("#alertCount").textContent = label;
+  const emptyText = state.alertStatus === "new"
+    ? "暂无新告警"
+    : state.alertStatus
+      ? `暂无${alertWorkflowLabel(state.alertStatus)}告警`
+      : "暂无匹配告警";
   $("#alerts").innerHTML = data.data.length
     ? data.data.map(alertMarkup).join("")
-    : `<div class="empty">暂无待处理告警</div>`;
+    : `<div class="empty">${esc(emptyText)}</div>`;
   $("#alertToggleList").textContent = state.alertExpanded ? "收起" : "展开清单";
   const currentPage = Math.floor(offset / ALERT_PAGE_LIMIT) + 1;
   const totalPages = Math.max(1, Math.ceil(data.total / ALERT_PAGE_LIMIT));
@@ -2844,6 +3001,7 @@ async function loadAlerts() {
   $("#alertPager").hidden = !state.alertExpanded || (offset <= 0 && data.total <= ALERT_PAGE_LIMIT);
   $("#alertPrev").disabled = offset <= 0;
   $("#alertNext").disabled = offset + ALERT_PAGE_LIMIT >= data.total;
+  bindReadButtons();
   bindAckButtons();
   bindIntelButtons();
   bindGitHubEvidenceButtons();
@@ -2970,6 +3128,28 @@ $("#sourceArchiveVersionRole").addEventListener("change", (event) => {
 });
 
 $("#sourceArchiveFile").addEventListener("change", updateSourceArchiveFileName);
+
+$("#sourceArchiveFetchLatest").addEventListener("click", async () => {
+  const button = $("#sourceArchiveFetchLatest");
+  const productName = $("#sourceArchiveProduct").value.trim() || state.sourceArchiveQ;
+  if (!productName) {
+    showModal("拉取失败", "请先在产品提示或搜索框里填写产品名。");
+    return;
+  }
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = "拉取中";
+  try {
+    await fetchLatestSourceArchive({ productName });
+    await Promise.all([loadSourceArchives(), loadMessages(), loadSummary()]);
+    setTimeout(loadSourceArchives, 5000);
+  } catch (error) {
+    showModal("拉取失败", error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+});
 
 $("#sourceArchiveUploadForm").addEventListener("submit", async (event) => {
   event.preventDefault();

@@ -119,7 +119,9 @@
           return;
         }
         const params = new URLSearchParams(location.search);
-        location.href = params.get("next") || "/app";
+        const next = params.get("next") || "/app";
+        const hash = location.hash || "";
+        location.href = next.includes("#") || !hash ? next : `${next}${hash}`;
       });
     </script>
   </body>

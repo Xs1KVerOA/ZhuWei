@@ -28,6 +28,7 @@ class ThreatbookVulnAdapter(SourceAdapter):
         items = []
         for entry in payload.get("data", {}).get("highrisk", []):
             title = entry.get("vuln_name_zh") or entry.get("id")
+            affects = _affects_list(entry.get("affects"))
             tags = []
             if entry.get("is0day"):
                 tags.append("0day")
@@ -47,13 +48,34 @@ class ThreatbookVulnAdapter(SourceAdapter):
                     aliases=[entry.get("id")],
                     published_at=entry.get("vuln_publish_time") or entry.get("vuln_update_time"),
                     updated_at=entry.get("vuln_update_time"),
-                    description=", ".join(entry.get("affects") or []),
+                    description=", ".join(affects),
                     url=f"https://x.threatbook.com/v5/vul/{entry.get('id')}",
-                    product=", ".join(entry.get("affects") or []),
+                    product=_product_from_affects(affects),
                     raw={**entry, "tags": tags},
                 )
             )
         return items
+
+
+def _affects_list(value) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    return []
+
+
+def _product_from_affects(affects: list[str]) -> str:
+    for value in affects:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        label = text.rsplit(">", 1)[-1].strip()
+        if label.lower() == "litellm":
+            return "LiteLLM"
+        if label:
+            return label
+    return ""
 
 
 def _chrome_ua() -> str:

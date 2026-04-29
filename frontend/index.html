@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>烛微 ZhuWei</title>
     <link rel="icon" href="/brand/logo-mark.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/assets/styles.css?v=20260428-github-evidence" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260428-analysis-source" />
   </head>
   <body>
     <header class="topbar">
@@ -165,6 +165,7 @@
           </label>
           <input id="sourceArchiveProduct" type="text" placeholder="产品提示，可留空" />
           <input id="sourceArchiveVersion" type="text" placeholder="源码版本，可留空" />
+          <button id="sourceArchiveFetchLatest" type="button">拉取最新版本</button>
           <button id="sourceArchiveUpload" type="submit" class="primary">上传源码</button>
         </form>
         <div class="subhead" id="sourceArchiveCount"></div>
@@ -318,7 +319,8 @@
           <div class="filters">
             <input id="alertQuery" type="search" placeholder="CVE、产品、标题" />
             <select id="alertStatus">
-              <option value="new">待处理</option>
+              <option value="new">新告警</option>
+              <option value="read">已读</option>
               <option value="acknowledged">已确认</option>
               <option value="">全部</option>
             </select>
@@ -388,8 +390,8 @@
       </section>
     </main>
 
-    <button id="dashboardJump" class="dashboard-jump" type="button" title="回到数据看板" aria-label="回到数据看板" hidden>
-      ↑ 数据看板
+    <button id="dashboardJump" class="dashboard-jump" type="button" title="回到当前视图顶部" aria-label="回到当前视图顶部" hidden>
+      ↑ 顶部
     </button>
 
     <div id="intelModal" class="modal" hidden>
@@ -405,6 +407,6 @@
       </section>
     </div>
 
-    <script src="/assets/app.js?v=20260428-github-evidence"></script>
+    <script src="/assets/app.js?v=20260428-analysis-source"></script>
   </body>
 </html>

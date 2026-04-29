@@ -343,7 +343,7 @@ class Settings:
         ).strip()
         self.github_user_agent = os.getenv("GITHUB_USER_AGENT", "ZhuWei-Vulnerability-Intel").strip() or "ZhuWei-Vulnerability-Intel"
         self.github_search_timeout_seconds = max(5, min(_int_env("GITHUB_SEARCH_TIMEOUT_SECONDS", 25), 120))
-        self.github_advisory_max_pages = max(1, min(_int_env("GITHUB_ADVISORY_MAX_PAGES", 1), 10))
+        self.github_advisory_max_pages = max(1, min(_int_env("GITHUB_ADVISORY_MAX_PAGES", 5), 10))
         self.github_advisory_page_size = max(10, min(_int_env("GITHUB_ADVISORY_PAGE_SIZE", 100), 100))
         self.github_evidence_enabled = _bool_env("GITHUB_EVIDENCE_ENABLED", True)
         self.github_evidence_auto_search_enabled = _bool_env("GITHUB_EVIDENCE_AUTO_SEARCH_ENABLED", True)

@@ -854,6 +854,32 @@ tbody tr:hover {
   background: #fffbeb;
 }
 
+.alert-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  margin-left: 6px;
+  border: 1px solid #dbeafe;
+  border-radius: 6px;
+  background: #eff6ff;
+  color: var(--blue);
+  padding: 2px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.alert-status.read {
+  border-color: #fed7aa;
+  background: #fff7ed;
+  color: #9a3412;
+}
+
+.alert-status.acknowledged {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+  color: var(--green);
+}
+
 .badge.severity-critical {
   color: #8f1010;
   border-color: #fca5a5;
@@ -1284,7 +1310,7 @@ a.intel-button:hover {
 
 .source-upload-form {
   display: grid;
-  grid-template-columns: minmax(220px, 1.2fr) minmax(160px, 0.8fr) 112px;
+  grid-template-columns: minmax(220px, 1.2fr) minmax(150px, 0.75fr) minmax(130px, 0.6fr) 128px 112px;
   gap: 10px;
   padding: 0 16px 14px;
   border-bottom: 1px solid var(--line);
@@ -2191,6 +2217,15 @@ a.analysis-source-pill:hover {
   border-color: #dbeafe;
   background: #eff6ff;
   color: var(--blue);
+}
+
+.analysis-progress {
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  background: #f8fafc;
+  color: #475569;
+  padding: 8px 10px;
+  font-size: 12px;
 }
 
 .analysis-output {

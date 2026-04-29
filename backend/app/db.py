@@ -168,6 +168,14 @@ def _sqlite_placeholders_to_psycopg(sql: str) -> str:
     return "".join(out)
 
 
+def _ci_like(value: Any) -> str:
+    return f"%{str(value or '').strip().lower()}%"
+
+
+def _ci_like_clause(expressions: Iterable[str]) -> str:
+    return "(" + " OR ".join(f"LOWER(COALESCE({expr}, '')) LIKE ?" for expr in expressions) + ")"
+
+
 def _postgres_lastrowid_sql(sql: str) -> tuple[str, bool]:
     stripped = sql.strip().rstrip(";")
     match = re.match(r"INSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_]*)\s", stripped, flags=re.I)
@@ -482,6 +490,7 @@ def init_db() -> None:
                 reason TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                read_at TEXT,
                 acknowledged_at TEXT,
                 FOREIGN KEY(vulnerability_id) REFERENCES vulnerabilities(id)
             );
@@ -824,6 +833,13 @@ def init_db() -> None:
         )
         _ensure_columns(
             conn,
+            "alerts",
+            {
+                "read_at": "TEXT",
+            },
+        )
+        _ensure_columns(
+            conn,
             "products",
             {
                 "vendor": "TEXT NOT NULL DEFAULT ''",
@@ -874,6 +890,11 @@ def init_db() -> None:
         _cleanup_noisy_product_matches(conn)
 
 
+def cleanup_product_attributions() -> dict[str, int]:
+    with connection() as conn:
+        return _cleanup_noisy_product_matches(conn)
+
+
 def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
     existing_rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     existing = {row["name"]: dict(row) for row in existing_rows}
@@ -907,10 +928,22 @@ def _column_default_from_ddl(ddl: str) -> str | None:
     return match.group(1).strip()
 
 
-def _cleanup_noisy_product_matches(conn: sqlite3.Connection) -> None:
+def _cleanup_noisy_product_matches(conn: sqlite3.Connection) -> dict[str, int]:
+    stats = {
+        "cleared_vulnerabilities": 0,
+        "deleted_links": 0,
+        "deleted_products": 0,
+        "deduped_links": 0,
+        "relinked_links": 0,
+        "recreated_products": 0,
+    }
+    stats["deduped_links"] += _dedupe_product_vulnerabilities_conn(conn)
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_product_vulns_product_vuln ON product_vulnerabilities(product_key, vulnerability_id)"
+    )
     rows = conn.execute(
         """
-        SELECT id, product, product_match_method, product_match_evidence
+        SELECT id, source, product, product_match_method, product_match_evidence, raw
         FROM vulnerabilities
         WHERE COALESCE(product, '') <> ''
            OR COALESCE(product_match_evidence, '') <> ''
@@ -922,6 +955,49 @@ def _cleanup_noisy_product_matches(conn: sqlite3.Connection) -> None:
         product = str(row["product"] or "")
         evidence = str(row["product_match_evidence"] or "")
         evidence_label = evidence.rsplit("：", 1)[-1] if "：" in evidence else ""
+        preferred_product = _preferred_product_label_for_row(dict(row))
+        if preferred_product and preferred_product != product:
+            old_product = product
+            conn.execute(
+                """
+                UPDATE vulnerabilities
+                SET product=?,
+                    product_match_method=CASE
+                        WHEN COALESCE(product_match_method, '') = '' THEN 'product_cleanup'
+                        ELSE product_match_method
+                    END,
+                    product_match_evidence=CASE
+                        WHEN COALESCE(product_match_evidence, '') = '' THEN ?
+                        ELSE product_match_evidence
+                    END
+                WHERE id=?
+                """,
+                (preferred_product, f"产品名清洗：{product} -> {preferred_product}", int(row["id"])),
+            )
+            _link_vulnerability_to_product_conn(
+                conn,
+                int(row["id"]),
+                preferred_product,
+                "product_cleanup",
+                0.95,
+                f"产品名清洗：{old_product or '-'} -> {preferred_product}",
+                raw={
+                    "resolver": "product_cleanup",
+                    "previous_product_name": old_product,
+                    "source": row["source"],
+                },
+            )
+            old_key = product_key(old_product)
+            new_key = product_key(preferred_product)
+            if old_key and old_key != new_key:
+                cursor = conn.execute(
+                    "DELETE FROM product_vulnerabilities WHERE vulnerability_id=? AND product_key=?",
+                    (int(row["id"]), old_key),
+                )
+                stats["deleted_links"] += int(cursor.rowcount or 0)
+                noisy_products.add(old_key)
+                stats["relinked_links"] += 1
+            product = preferred_product
         if _is_noisy_product_label(product) or _is_noisy_product_label(evidence_label):
             noisy_ids.append(int(row["id"]))
             if product:
@@ -930,7 +1006,7 @@ def _cleanup_noisy_product_matches(conn: sqlite3.Connection) -> None:
                 noisy_products.add(product_key(evidence_label))
     if noisy_ids:
         placeholders = ",".join("?" for _ in noisy_ids)
-        conn.execute(
+        cursor = conn.execute(
             f"""
             UPDATE vulnerabilities
             SET product='',
@@ -942,14 +1018,148 @@ def _cleanup_noisy_product_matches(conn: sqlite3.Connection) -> None:
             """,
             noisy_ids,
         )
-        conn.execute(
+        stats["cleared_vulnerabilities"] += int(cursor.rowcount or 0)
+        cursor = conn.execute(
             f"DELETE FROM product_vulnerabilities WHERE vulnerability_id IN ({placeholders})",
             noisy_ids,
         )
+        stats["deleted_links"] += int(cursor.rowcount or 0)
+    link_rows = conn.execute(
+        """
+        SELECT pv.product_key, pv.vulnerability_id, pv.product_name, pv.match_method,
+               pv.confidence, pv.evidence, pv.raw,
+               p.name AS catalog_name, p.source AS catalog_source
+        FROM product_vulnerabilities pv
+        LEFT JOIN products p ON p.product_key=pv.product_key
+        """
+    ).fetchall()
+    delete_pairs: list[tuple[str, int]] = []
+    touched_product_keys: set[str] = set()
+    touched_vulnerability_ids: set[int] = set()
+    for row in link_rows:
+        product_name = str(row["product_name"] or row["catalog_name"] or "")
+        evidence = str(row["evidence"] or "")
+        evidence_label = evidence.rsplit("：", 1)[-1] if "：" in evidence else ""
+        cleaned = _clean_product_label(product_name)
+        key = str(row["product_key"] or "")
+        vuln_id = int(row["vulnerability_id"] or 0)
+        if cleaned and not row["catalog_name"] and key and vuln_id:
+            _link_vulnerability_to_product_conn(
+                conn,
+                vuln_id,
+                cleaned,
+                str(row["match_method"] or "product_cleanup"),
+                float(row["confidence"] or 0.8),
+                evidence or f"补全缺失产品记录：{cleaned}",
+                raw={
+                    "resolver": "product_cleanup",
+                    "previous_product_name": product_name,
+                    "previous_product_key": key,
+                    "previous_raw": _json_value(row["raw"], {}),
+                },
+            )
+            stats["recreated_products"] += 1
+            if product_key(cleaned) != key:
+                delete_pairs.append((key, vuln_id))
+                touched_product_keys.add(key)
+                touched_product_keys.add(product_key(cleaned))
+                touched_vulnerability_ids.add(vuln_id)
+            continue
+        if cleaned and cleaned != product_name and key and vuln_id:
+            _link_vulnerability_to_product_conn(
+                conn,
+                vuln_id,
+                cleaned,
+                str(row["match_method"] or "product_cleanup"),
+                float(row["confidence"] or 0.8),
+                evidence.replace(product_name, cleaned) if evidence else f"产品名清洗：{product_name} -> {cleaned}",
+                raw={
+                    "resolver": "product_cleanup",
+                    "previous_product_name": product_name,
+                    "previous_product_key": key,
+                    "previous_raw": _json_value(row["raw"], {}),
+                },
+            )
+            delete_pairs.append((key, vuln_id))
+            touched_product_keys.add(key)
+            touched_product_keys.add(product_key(cleaned))
+            touched_vulnerability_ids.add(vuln_id)
+            stats["relinked_links"] += 1
+            continue
+        if (
+            not cleaned
+            or _is_noisy_product_label(product_name)
+            or _is_noisy_product_label(evidence_label)
+            or _is_generic_catalog_product(product_name)
+        ):
+            if key and vuln_id:
+                delete_pairs.append((key, vuln_id))
+                touched_product_keys.add(key)
+                touched_vulnerability_ids.add(vuln_id)
+    if delete_pairs:
+        for key, vuln_id in delete_pairs:
+            cursor = conn.execute(
+                "DELETE FROM product_vulnerabilities WHERE product_key=? AND vulnerability_id=?",
+                (key, vuln_id),
+            )
+            stats["deleted_links"] += int(cursor.rowcount or 0)
+    for vuln_id in touched_vulnerability_ids:
+        remaining = conn.execute(
+            "SELECT product_name, match_method, confidence, evidence FROM product_vulnerabilities WHERE vulnerability_id=? ORDER BY confidence DESC LIMIT 1",
+            (vuln_id,),
+        ).fetchone()
+        if remaining is None:
+            cursor = conn.execute(
+                """
+                UPDATE vulnerabilities
+                SET product='',
+                    product_match_method='',
+                    product_match_confidence=NULL,
+                    product_match_evidence='',
+                    product_resolved_at=NULL
+                WHERE id=?
+                """,
+                (vuln_id,),
+            )
+            stats["cleared_vulnerabilities"] += int(cursor.rowcount or 0)
+        else:
+            conn.execute(
+                """
+                UPDATE vulnerabilities
+                SET product=?,
+                    product_match_method=?,
+                    product_match_confidence=?,
+                    product_match_evidence=?
+                WHERE id=?
+                """,
+                (
+                    remaining["product_name"] or "",
+                    remaining["match_method"] or "",
+                    remaining["confidence"],
+                    remaining["evidence"] or "",
+                    vuln_id,
+                ),
+            )
     clean_keys = [key for key in noisy_products if key]
+    product_rows = conn.execute(
+        """
+        SELECT product_key, name
+        FROM products
+        WHERE source='vulnerability_match'
+           OR source='source_archives'
+        """
+    ).fetchall()
+    for row in product_rows:
+        key = str(row["product_key"] or "")
+        name = str(row["name"] or "")
+        if key and (not _clean_product_label(name) or _is_noisy_product_label(name) or _is_generic_catalog_product(name)):
+            clean_keys.append(key)
+    for key in touched_product_keys:
+        _refresh_product_counts_conn(conn, key)
+    clean_keys = sorted({key for key in clean_keys if key})
     if clean_keys:
         placeholders = ",".join("?" for _ in clean_keys)
-        conn.execute(
+        cursor = conn.execute(
             f"""
             DELETE FROM products
             WHERE product_key IN ({placeholders})
@@ -957,6 +1167,47 @@ def _cleanup_noisy_product_matches(conn: sqlite3.Connection) -> None:
             """,
             clean_keys,
         )
+        stats["deleted_products"] += int(cursor.rowcount or 0)
+    stats["deduped_links"] += _dedupe_product_vulnerabilities_conn(conn)
+    return stats
+
+
+def _dedupe_product_vulnerabilities_conn(conn: sqlite3.Connection) -> int:
+    if _using_postgres():
+        cursor = conn.execute(
+            """
+            DELETE FROM product_vulnerabilities pv
+            USING (
+                SELECT ctid,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY product_key, vulnerability_id
+                           ORDER BY confidence DESC, updated_at DESC, created_at DESC
+                       ) AS rn
+                FROM product_vulnerabilities
+            ) ranked
+            WHERE pv.ctid = ranked.ctid
+              AND ranked.rn > 1
+            """
+        )
+        return int(cursor.rowcount or 0)
+    cursor = conn.execute(
+        """
+        DELETE FROM product_vulnerabilities
+        WHERE rowid IN (
+            SELECT rowid
+            FROM (
+                SELECT rowid,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY product_key, vulnerability_id
+                           ORDER BY confidence DESC, updated_at DESC, created_at DESC
+                       ) AS rn
+                FROM product_vulnerabilities
+            )
+            WHERE rn > 1
+        )
+        """
+    )
+    return int(cursor.rowcount or 0)
 
 
 def _seed_common_product_aliases(conn: sqlite3.Connection) -> None:
@@ -1599,6 +1850,7 @@ def upsert_vulnerabilities(items: list[dict[str, Any]]) -> int:
     with connection() as conn:
         for item in items:
             item.update(extract_item_intel(item))
+            item["product"] = _preferred_product_label_for_item(item)
             dedupe_key = item.get("dedupe_key") or dedupe_key_for_item(item)
             item["dedupe_key"] = dedupe_key
             duplicate = _find_duplicate_row(conn, item)
@@ -1757,17 +2009,20 @@ def list_products(
         clauses.append("source = ?")
         args.append(source)
     if query:
-        like = f"%{query}%"
+        like = _ci_like(query)
         normalized_like = f"%{_normalize_product_text(query)}%"
         clauses.append(
             """
             (
-                name LIKE ?
-                OR normalized_name LIKE ?
+                LOWER(COALESCE(name, '')) LIKE ?
+                OR LOWER(COALESCE(normalized_name, '')) LIKE ?
                 OR EXISTS (
                     SELECT 1 FROM product_aliases pa
                     WHERE pa.product_key = products.product_key
-                      AND (pa.alias LIKE ? OR pa.normalized_alias LIKE ?)
+                      AND (
+                        LOWER(COALESCE(pa.alias, '')) LIKE ?
+                        OR LOWER(COALESCE(pa.normalized_alias, '')) LIKE ?
+                      )
                 )
             )
             """
@@ -1850,15 +2105,15 @@ def _latest_product_vulnerabilities_conn(
     ).fetchall()
     if linked_rows:
         return [_vulnerability_summary_from_row(row) for row in linked_rows]
-    like = f"%{name}%"
+    like = _ci_like(name)
     compact_like = f"%{compact}%"
     rows = conn.execute(
         """
         SELECT id, title, severity, cve_id, url, source, published_at, updated_at, first_seen_at
         FROM vulnerabilities
         WHERE product = ?
-           OR title LIKE ?
-           OR description LIKE ?
+           OR LOWER(COALESCE(title, '')) LIKE ?
+           OR LOWER(COALESCE(description, '')) LIKE ?
            OR REPLACE(REPLACE(LOWER(COALESCE(title, '')), ' ', ''), '　', '') LIKE ?
            OR REPLACE(REPLACE(LOWER(COALESCE(description, '')), ' ', ''), '　', '') LIKE ?
         ORDER BY COALESCE(published_at, updated_at, first_seen_at) DESC, id DESC
@@ -2634,10 +2889,10 @@ def _product_poc_exp_summary(row: sqlite3.Row) -> dict[str, Any]:
 def align_products_for_items(items: list[dict[str, Any]], *, max_matches: int = 3) -> dict[str, int]:
     """Directly link freshly ingested vulnerabilities to product catalog rows."""
     if not items:
-        return {"checked": 0, "linked": 0, "created_products": 0}
+        return {"checked": 0, "linked": 0, "updated": 0, "created_products": 0}
     with connection() as conn:
         candidates = _product_candidates_conn(conn)
-        checked = linked = created_products = 0
+        checked = linked = updated = created_products = 0
         for item in items:
             vuln = _vulnerability_row_for_item_conn(conn, item)
             if vuln is None:
@@ -2659,8 +2914,16 @@ def align_products_for_items(items: list[dict[str, Any]], *, max_matches: int = 
                     raw={"resolver": "direct", "match": match},
                 )
                 linked += int(result["linked"])
+                updated += int(result.get("updated", 0))
                 created_products += int(result["created_product"])
-        return {"checked": checked, "linked": linked, "created_products": created_products}
+        cleanup = _cleanup_noisy_product_matches(conn)
+        return {
+            "checked": checked,
+            "linked": linked,
+            "updated": updated,
+            "created_products": created_products,
+            "cleaned": int(cleanup.get("deleted_links", 0)),
+        }
 
 
 def align_vulnerability_products(*, limit: int = 0, only_unlinked: bool = True) -> dict[str, int]:
@@ -2687,7 +2950,7 @@ def align_vulnerability_products(*, limit: int = 0, only_unlinked: bool = True) 
             """,
             args,
         ).fetchall()
-        checked = linked = created_products = 0
+        checked = linked = updated = created_products = 0
         for row in rows:
             checked += 1
             for match in _direct_product_matches(dict(row), candidates, max_matches=3):
@@ -2701,8 +2964,16 @@ def align_vulnerability_products(*, limit: int = 0, only_unlinked: bool = True) 
                     raw={"resolver": "direct_backfill", "match": match},
                 )
                 linked += int(result["linked"])
+                updated += int(result.get("updated", 0))
                 created_products += int(result["created_product"])
-        return {"checked": checked, "linked": linked, "created_products": created_products}
+        cleanup = _cleanup_noisy_product_matches(conn)
+        return {
+            "checked": checked,
+            "linked": linked,
+            "updated": updated,
+            "created_products": created_products,
+            "cleaned": int(cleanup.get("deleted_links", 0)),
+        }
 
 
 def ai_product_resolution_candidates(*, limit: int = 5) -> list[dict[str, Any]]:
@@ -2717,7 +2988,7 @@ def ai_product_resolution_candidates(*, limit: int = 5) -> list[dict[str, Any]]:
                     SELECT 1
                     FROM alerts a
                     WHERE a.vulnerability_id = v.id
-                      AND a.status='new'
+                      AND a.status IN ('new', 'read')
                 )
                 OR v.first_seen_at >= ?
                 OR COALESCE(v.product_match_method, '') = ''
@@ -2904,6 +3175,8 @@ def _product_candidates_conn(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for row in [*product_rows, *alias_rows]:
         item = dict(row)
+        if not _candidate_can_match(str(item.get("normalized_name") or ""), str(item.get("name") or "")):
+            continue
         marker = (str(item.get("product_key") or ""), str(item.get("normalized_name") or ""))
         if marker in seen:
             continue
@@ -3011,6 +3284,14 @@ def _link_vulnerability_to_product_conn(
     vuln = conn.execute("SELECT * FROM vulnerabilities WHERE id=?", (vulnerability_id,)).fetchone()
     if vuln is None:
         return {"linked": 0, "created_product": 0}
+    existing_link = conn.execute(
+        """
+        SELECT product_name, match_method, confidence, evidence
+        FROM product_vulnerabilities
+        WHERE product_key=? AND vulnerability_id=?
+        """,
+        (key, vulnerability_id),
+    ).fetchone()
     conn.execute(
         """
         INSERT INTO products (
@@ -3043,7 +3324,7 @@ def _link_vulnerability_to_product_conn(
             json.dumps({"source": "vulnerability_match"}, ensure_ascii=False),
         ),
     )
-    cursor = conn.execute(
+    conn.execute(
         """
         INSERT INTO product_vulnerabilities (
             product_key, vulnerability_id, product_name, match_method,
@@ -3073,6 +3354,15 @@ def _link_vulnerability_to_product_conn(
             now,
             json.dumps(raw or {}, ensure_ascii=False),
         ),
+    )
+    upgraded_link = bool(
+        existing_link is not None
+        and (
+            float(confidence or 0) > float(existing_link["confidence"] or 0)
+            or str(existing_link["product_name"] or "") != name
+            or str(existing_link["match_method"] or "") != match_method
+            or str(existing_link["evidence"] or "") != evidence[:1000]
+        )
     )
     local_count = _product_link_count_conn(conn, key)
     poc_count = int(
@@ -3129,7 +3419,11 @@ def _link_vulnerability_to_product_conn(
         ),
     )
     _refresh_vulnerability_quality_conn(conn, vulnerability_id)
-    return {"linked": 1 if cursor.rowcount else 0, "created_product": 0 if existing_product else 1}
+    return {
+        "linked": 0 if existing_link is not None else 1,
+        "updated": 1 if upgraded_link else 0,
+        "created_product": 0 if existing_product else 1,
+    }
 
 
 def _product_labels_from_vulnerability(row: dict[str, Any]) -> list[str]:
@@ -3199,10 +3493,62 @@ NOISY_PRODUCT_NORMALIZED = {
     "bythisvulnerability",
     "bythisvulnerabilityisan",
     "bythisvulnerabilityisthe",
+    "bythisissue",
+    "bythisissueisan",
+    "bythisissueisthe",
+    "penetrationtestingengineersat",
     "systemsThisvulnerabilitycouldaffect",
     "functionr7webssecurityhandlerfunction",
     "functionupdatestoryboardurl",
     "arbitrarycodeexecution",
+    "arbitrary",
+    "client",
+    "clients",
+    "device",
+    "devices",
+    "http",
+    "improperneutralization",
+    "improperneutralizationofinput",
+    "time",
+    "config",
+    "configuration",
+    "file",
+    "files",
+    "kernel",
+    "library",
+    "libraries",
+    "module",
+    "package",
+    "plugin",
+    "plugins",
+    "reader",
+    "readers",
+    "root",
+    "router",
+    "routers",
+    "server",
+    "service",
+    "services",
+    "java",
+    "rust",
+    "word",
+    "office",
+    "mobiledevices",
+    "multiplechipsets",
+    "multipleproducts",
+    "localprivilegeescalation",
+    "pervendoradvisory",
+    "perl",
+    "produ",
+    "authentication",
+    "byan",
+    "code",
+    "reflected",
+    "remote",
+    "serversiderequestforgeryssrf",
+    "sql",
+    "thecontextofthecurrentuser",
+    "unrestricteduploadof",
 }
 
 
@@ -3212,6 +3558,7 @@ NOISY_PRODUCT_PREFIXES = [
     "a vulnerability was",
     "a vulnerability has",
     "an improper ",
+    "improper ",
     "an issue was",
     "a vulnerability in ",
     "a vulnerability bypass ",
@@ -3229,12 +3576,78 @@ NOISY_PRODUCT_PREFIXES = [
     "this issue ",
     "affected by this issue",
     "by this vulnerability",
+    "by this issue",
+    "penetration testing engineers at",
     "the affected element",
     "the affected function",
     "function ",
     "ghsl-",
     "systems. this vulnerability",
+    "local privilege escalation",
+    "per vendor advisory",
+    "server-side request forgery",
+    "the context of the current user",
+    "unrestricted upload of",
 ]
+
+
+NOISY_PRODUCT_CONTAINS = [
+    "multiple products",
+    "multiple vulnerabilities",
+    "mobile devices",
+    "multiple chipsets",
+]
+
+
+VULNERABILITY_DESCRIPTOR_WORDS = {
+    "absolute",
+    "alternate",
+    "arbitrary",
+    "authentication",
+    "bypass",
+    "buffer",
+    "channel",
+    "code",
+    "command",
+    "corruption",
+    "cross-site",
+    "default",
+    "deletion",
+    "disclosure",
+    "download",
+    "escalation",
+    "file",
+    "following",
+    "hard-coded",
+    "heap-based",
+    "improper",
+    "incorrect",
+    "inclusion",
+    "injection",
+    "link",
+    "memory",
+    "missing",
+    "module",
+    "os",
+    "out-of-bounds",
+    "overflow",
+    "path",
+    "permissions",
+    "php",
+    "privilege",
+    "remote",
+    "rce",
+    "request",
+    "server-side",
+    "scripting",
+    "ssrf",
+    "template",
+    "traversal",
+    "unprotected",
+    "unrestricted",
+    "use",
+    "xss",
+}
 
 
 def _structured_product_labels(row: dict[str, Any]) -> list[str]:
@@ -3353,6 +3766,40 @@ def _split_product_labels(value: str) -> list[str]:
     return labels
 
 
+def _preferred_product_label_from_value(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    for label in _split_product_labels(raw):
+        cleaned = _clean_product_label(label)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _preferred_product_label_for_item(item: dict[str, Any]) -> str:
+    product = _preferred_product_label_from_value(item.get("product"))
+    if product:
+        return product
+    if item.get("product"):
+        return ""
+    return ""
+
+
+def _preferred_product_label_for_row(row: dict[str, Any]) -> str:
+    raw = _json_value(row.get("raw"), {})
+    if isinstance(raw, dict):
+        affects = raw.get("affects")
+        if isinstance(affects, str):
+            affects = [affects]
+        if isinstance(affects, list):
+            for value in affects[:8]:
+                label = _preferred_product_label_from_value(value)
+                if label:
+                    return label
+    return _preferred_product_label_from_value(row.get("product"))
+
+
 def _product_labels_from_text(value: str) -> list[str]:
     text = re.sub(r"^CVE-\d{4}-\d{4,}[:：\\s-]*", "", value or "", flags=re.I).strip()
     labels: list[str] = []
@@ -3372,14 +3819,18 @@ def _product_labels_from_text(value: str) -> list[str]:
 def _clean_product_label(value: str) -> str:
     text = str(value or "").strip(" \t\r\n-:：,，.;；()（）[]【】")
     text = re.sub(r"CVE-\d{4}-\d{4,}", "", text, flags=re.I).strip()
+    text = _collapse_repeated_product_tokens(text)
     text = _strip_product_versions(text)
+    text = _strip_descriptor_after_separator(text)
+    text = _strip_vulnerability_descriptor_suffix(text)
     text = re.split(
-        r"\s+(?:up to|before|through|prior to|versions?|version|exists|contains|存在|漏洞|安全漏洞|高危漏洞|严重漏洞)\b",
+        r"\s+(?:up to|before|through|prior to|versions?|version|exists|contains|has|allows?|could|may|leads?|存在|漏洞|安全漏洞|高危漏洞|严重漏洞)\b",
         text,
         maxsplit=1,
         flags=re.I,
     )[0].strip(" \t\r\n-:：,，.;；()（）[]【】")
     text = re.sub(r"\s+(?:of|in|from)\s+the\s+(?:file|function|component|argument)\b.*$", "", text, flags=re.I).strip()
+    text = _collapse_repeated_product_tokens(text)
     if _is_noisy_product_label(text) or len(text) > 120:
         return ""
     compact = _normalize_product_text(text)
@@ -3388,6 +3839,62 @@ def _clean_product_label(value: str) -> str:
     noisy = {"cve", "vulnerability", "security", "漏洞", "安全漏洞", "unknown", "none"}
     if compact in noisy or compact in NOISY_PRODUCT_NORMALIZED:
         return ""
+    if re.match(r"(?i)^s2-\d+", text):
+        return ""
+    return _canonical_product_display(text, compact)
+
+
+def _canonical_product_display(label: str, normalized: str) -> str:
+    display_names = {
+        "litellm": "LiteLLM",
+    }
+    return display_names.get(normalized, label)
+
+
+def _collapse_repeated_product_tokens(value: str) -> str:
+    tokens = str(value or "").split()
+    if len(tokens) < 2:
+        return str(value or "").strip()
+    deduped: list[str] = []
+    for token in tokens:
+        if deduped and deduped[-1].lower() == token.lower():
+            continue
+        deduped.append(token)
+    tokens = deduped
+    while len(tokens) >= 3 and tokens[0].lower() == tokens[-1].lower():
+        tokens = tokens[:-1]
+    half = len(tokens) // 2
+    if half and len(tokens) % 2 == 0:
+        first = " ".join(tokens[:half]).lower()
+        second = " ".join(tokens[half:]).lower()
+        if first == second:
+            tokens = tokens[:half]
+    return " ".join(tokens).strip()
+
+
+def _strip_vulnerability_descriptor_suffix(value: str) -> str:
+    tokens = str(value or "").split()
+    if len(tokens) < 2:
+        return str(value or "").strip()
+    for index in range(1, len(tokens)):
+        token = tokens[index].strip(" \t\r\n-:：,，.;；()（）[]【】'\"").lower()
+        if token in VULNERABILITY_DESCRIPTOR_WORDS:
+            return " ".join(tokens[:index]).strip()
+    return str(value or "").strip()
+
+
+def _strip_descriptor_after_separator(value: str) -> str:
+    text = str(value or "").strip()
+    match = re.match(r"^(.{2,80}?)[：:]\s+(.+)$", text)
+    if not match:
+        return text
+    right = match.group(2).lower()
+    right_tokens = {
+        token.strip(" \t\r\n-:：,，.;；()（）[]【】'\"").lower()
+        for token in right.split()
+    }
+    if right_tokens & VULNERABILITY_DESCRIPTOR_WORDS:
+        return match.group(1).strip()
     return text
 
 
@@ -3411,6 +3918,12 @@ def _is_noisy_product_label(value: str) -> bool:
     compact = _normalize_product_text(text)
     if compact in NOISY_PRODUCT_NORMALIZED:
         return True
+    if any(marker in text for marker in NOISY_PRODUCT_CONTAINS):
+        return True
+    if re.match(r"(?i)^s2-\d+", text):
+        return True
+    if text.startswith("package executes ") or "api explorer" in text:
+        return True
     if any(text.startswith(prefix) for prefix in NOISY_PRODUCT_PREFIXES):
         return True
     if re.match(r"^(?:the\s+)?(?:file|function|component|argument|parameter|handler)\s+", text):
@@ -3421,10 +3934,20 @@ def _is_noisy_product_label(value: str) -> bool:
     return False
 
 
+def _is_generic_catalog_product(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    compact = _normalize_product_text(text)
+    if compact in NOISY_PRODUCT_NORMALIZED:
+        return True
+    return False
+
+
 def _candidate_can_match(normalized: str, name: str) -> bool:
     if not normalized or not name:
         return False
-    if normalized in NOISY_PRODUCT_NORMALIZED or _is_noisy_product_label(name):
+    if normalized in NOISY_PRODUCT_NORMALIZED or _is_noisy_product_label(name) or _is_generic_catalog_product(name):
         return False
     if len(normalized) >= 4:
         return True
@@ -3435,7 +3958,7 @@ def _candidate_appears(normalized: str, name: str, compact_text: str, lower_text
     if not normalized or normalized not in compact_text:
         return False
     ascii_name = re.fullmatch(r"[A-Za-z0-9_.-]+", name or "") is not None
-    if ascii_name and len(normalized) <= 3:
+    if ascii_name:
         return re.search(rf"(?<![a-z0-9_.-]){re.escape(name.lower())}(?![a-z0-9_.-])", lower_text) is not None
     return True
 
@@ -3619,9 +4142,8 @@ def list_vulnerabilities(
         clauses.append("severity = ?")
         args.append(severity)
     if query:
-        like = f"%{query}%"
-        clauses.append("(title LIKE ? OR cve_id LIKE ? OR aliases LIKE ? OR product LIKE ?)")
-        args.extend([like, like, like, like])
+        clauses.append(_ci_like_clause(["title", "cve_id", "aliases", "product"]))
+        args.extend([_ci_like(query)] * 4)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     partition = "CASE WHEN dedupe_key <> '' THEN dedupe_key ELSE 'row:' || id END"
@@ -4199,7 +4721,12 @@ def dedupe_key_for_item(item: dict[str, Any]) -> str:
 
 
 def product_label_for_item(item: dict[str, Any]) -> str:
-    return str(item.get("product") or _asset_from_title(item.get("title") or "")).strip()
+    product = _preferred_product_label_from_value(item.get("product"))
+    if product:
+        return product
+    if item.get("product"):
+        return ""
+    return str(_asset_from_title(item.get("title") or "")).strip()
 
 
 def product_key_for_item(item: dict[str, Any]) -> str:
@@ -4368,17 +4895,17 @@ def list_source_archives(
         clauses.append("version_role=?")
         args.append(version_role)
     if query:
-        like = f"%{query}%"
+        like = _ci_like(query)
         clauses.append(
             """
             (
-                filename LIKE ?
-                OR product_hint LIKE ?
-                OR suggested_product_name LIKE ?
-                OR product_name LIKE ?
-                OR source_version LIKE ?
-                OR version_role LIKE ?
-                OR sha256 LIKE ?
+                LOWER(COALESCE(filename, '')) LIKE ?
+                OR LOWER(COALESCE(product_hint, '')) LIKE ?
+                OR LOWER(COALESCE(suggested_product_name, '')) LIKE ?
+                OR LOWER(COALESCE(product_name, '')) LIKE ?
+                OR LOWER(COALESCE(source_version, '')) LIKE ?
+                OR LOWER(COALESCE(version_role, '')) LIKE ?
+                OR LOWER(COALESCE(sha256, '')) LIKE ?
             )
             """
         )
@@ -4738,7 +5265,7 @@ def summary() -> dict[str, Any]:
         ).fetchone()["n"]
         source_archives = conn.execute("SELECT COUNT(*) AS n FROM source_archives").fetchone()["n"]
         source_archives_pending = conn.execute(
-            "SELECT COUNT(*) AS n FROM source_archives WHERE status IN ('queued', 'analyzing', 'needs_confirmation')"
+            "SELECT COUNT(*) AS n FROM source_archives WHERE status IN ('fetching', 'queued', 'analyzing', 'needs_confirmation')"
         ).fetchone()["n"]
         today = conn.execute(
             "SELECT COUNT(*) AS n FROM vulnerabilities WHERE published_at >= ?",
@@ -4749,12 +5276,24 @@ def summary() -> dict[str, Any]:
         alert_severities, alert_cutoff = _alert_window(conn)
         alert_placeholders = ", ".join("?" for _ in alert_severities)
         alert_date_expr = _alert_date_expr("v")
-        alerts = conn.execute(
+        new_alerts = conn.execute(
             f"""
             SELECT COUNT(*) AS n
             FROM alerts a
             JOIN vulnerabilities v ON v.id = a.vulnerability_id
             WHERE a.status='new'
+              AND v.source NOT IN ('doonsec_wechat')
+              AND LOWER(COALESCE(v.severity, 'unknown')) IN ({alert_placeholders})
+              AND {alert_date_expr} >= ?
+            """,
+            [*alert_severities, alert_cutoff],
+        ).fetchone()["n"]
+        read_alerts = conn.execute(
+            f"""
+            SELECT COUNT(*) AS n
+            FROM alerts a
+            JOIN vulnerabilities v ON v.id = a.vulnerability_id
+            WHERE a.status='read'
               AND v.source NOT IN ('doonsec_wechat')
               AND LOWER(COALESCE(v.severity, 'unknown')) IN ({alert_placeholders})
               AND {alert_date_expr} >= ?
@@ -4809,7 +5348,9 @@ def summary() -> dict[str, Any]:
         "published_today": today,
         "enabled_sources": sources,
         "running_jobs": runs,
-        "open_alerts": alerts,
+        "open_alerts": int(new_alerts or 0) + int(read_alerts or 0),
+        "new_alerts": new_alerts,
+        "read_alerts": read_alerts,
         "acknowledged_alerts": acknowledged_alerts,
         "analysis_queued": analysis_counts.get("queued", 0),
         "analysis_running": analysis_counts.get("running", 0),
@@ -5449,6 +5990,58 @@ def finish_vulnerability_analysis(
         return None if row is None else _deserialize_vuln(dict(row))
 
 
+def update_vulnerability_analysis_source_progress(
+    vulnerability_id: int,
+    *,
+    run_id: str = "",
+    source_title: str = "",
+    source_url: str = "",
+    source_local_path: str = "",
+) -> dict[str, Any] | None:
+    title = str(source_title or "").strip()
+    url = str(source_url or "").strip()
+    local_path = str(source_local_path or "").strip()
+    if not title and not url and not local_path:
+        return None
+    with connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE vulnerabilities
+            SET
+                analysis_source_found=1,
+                analysis_source_url=?,
+                analysis_source_local_path=?,
+                analysis_source_title=?,
+                analysis_source_cleaned_at='',
+                analysis_error=CASE
+                    WHEN analysis_failure_reason='源码未搜索到' THEN ''
+                    ELSE analysis_error
+                END,
+                analysis_failure_reason=CASE
+                    WHEN analysis_failure_reason='源码未搜索到' THEN ''
+                    ELSE analysis_failure_reason
+                END
+            WHERE id=?
+              AND analysis_status IN ('queued', 'running')
+              AND (?='' OR analysis_run_id=?)
+            """,
+            (
+                url[:1000],
+                local_path[:1000],
+                (title or Path(local_path).name or "源码已发现")[:300],
+                vulnerability_id,
+                run_id or "",
+                run_id or "",
+            ),
+        )
+        if cursor.rowcount == 0:
+            return None
+        row = conn.execute(
+            "SELECT * FROM vulnerabilities WHERE id=?", (vulnerability_id,)
+        ).fetchone()
+        return None if row is None else _deserialize_vuln(dict(row))
+
+
 def fail_vulnerability_analysis(vulnerability_id: int, error: str) -> dict[str, Any] | None:
     now = utc_now()
     reason = _analysis_failure_reason(error)
@@ -5488,7 +6081,27 @@ def _analysis_failure_reason(error: str) -> str:
     if "：" in text:
         return text.split("：", 1)[0][:80]
     lower = text.lower()
-    if any(marker in lower for marker in ["deepseek", "api key", "quota", "rate limit", "model", "401", "403", "429"]):
+    if any(
+        marker in lower
+        for marker in [
+            "deepseek",
+            "api key",
+            "quota",
+            "balance",
+            "balance not enough",
+            "payment required",
+            "rate limit",
+            "non-sse",
+            "upstream returned",
+            "api_error",
+            "retcode",
+            "model",
+            "401",
+            "402",
+            "403",
+            "429",
+        ]
+    ):
         return "模型源异常"
     if any(marker in lower for marker in ["source", "repository", "源码"]):
         return "源码未搜索到"
@@ -5709,7 +6322,11 @@ def list_analysis_workbench(query: str = "", limit: int = 8) -> dict[str, Any]:
             "COALESCE(analysis_finished_at, analysis_started_at, first_seen_at) DESC, id DESC",
         )
     for item in running:
-        item["analysis_events"] = list_analysis_events(int(item["id"]), limit=60)["data"]
+        item["analysis_events"] = list_analysis_events(
+            int(item["id"]),
+            run_id=str(item.get("analysis_run_id") or ""),
+            limit=60,
+        )["data"]
     return {
         "counts": {
             "queued": counts.get("queued", 0),
@@ -5737,9 +6354,8 @@ def _analysis_rows(
     clauses = [f"analysis_status IN ({placeholders})"]
     args: list[Any] = [*statuses]
     if query:
-        like = f"%{query}%"
-        clauses.append("(title LIKE ? OR cve_id LIKE ? OR aliases LIKE ? OR product LIKE ?)")
-        args.extend([like, like, like, like])
+        clauses.append(_ci_like_clause(["title", "cve_id", "aliases", "product"]))
+        args.extend([_ci_like(query)] * 4)
     where = f"WHERE {' AND '.join(clauses)}"
     rows = conn.execute(
         f"""
@@ -5815,15 +6431,15 @@ def list_alerts(
         clauses.append(f"{_alert_date_expr('v')} >= ?")
         args.append(published_after)
     if query:
-        like = f"%{query}%"
+        like = _ci_like(query)
         clauses.append(
             """
             (
-                v.cve_id LIKE ?
-                OR v.product LIKE ?
-                OR v.title LIKE ?
-                OR v.aliases LIKE ?
-                OR a.dedupe_key LIKE ?
+                LOWER(COALESCE(v.cve_id, '')) LIKE ?
+                OR LOWER(COALESCE(v.product, '')) LIKE ?
+                OR LOWER(COALESCE(v.title, '')) LIKE ?
+                OR LOWER(COALESCE(v.aliases, '')) LIKE ?
+                OR LOWER(COALESCE(a.dedupe_key, '')) LIKE ?
             )
             """
         )
@@ -5848,6 +6464,7 @@ def list_alerts(
                 a.reason,
                 a.created_at AS alert_created_at,
                 a.updated_at AS alert_updated_at,
+                a.read_at,
                 a.acknowledged_at,
                 v.*
             FROM alerts a
@@ -5870,12 +6487,35 @@ def acknowledge_alert(alert_id: int) -> bool:
         cursor = conn.execute(
             """
             UPDATE alerts
-            SET status='acknowledged', acknowledged_at=?, updated_at=?
+            SET status='acknowledged',
+                read_at=COALESCE(read_at, ?),
+                acknowledged_at=?,
+                updated_at=?
             WHERE id=? AND status != 'acknowledged'
+            """,
+            (now, now, now, alert_id),
+        )
+        return cursor.rowcount > 0
+
+
+def mark_alert_read(alert_id: int) -> bool:
+    now = utc_now()
+    with connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE alerts
+            SET status='read', read_at=?, updated_at=?
+            WHERE id=? AND status='new'
             """,
             (now, now, alert_id),
         )
-        return cursor.rowcount > 0
+        if cursor.rowcount > 0:
+            return True
+        row = conn.execute(
+            "SELECT id FROM alerts WHERE id=? AND status IN ('read', 'acknowledged')",
+            (alert_id,),
+        ).fetchone()
+        return row is not None
 
 
 def get_alert(alert_id: int) -> dict[str, Any] | None:
@@ -5889,6 +6529,7 @@ def get_alert(alert_id: int) -> dict[str, Any] | None:
                 a.reason,
                 a.created_at AS alert_created_at,
                 a.updated_at AS alert_updated_at,
+                a.read_at,
                 a.acknowledged_at,
                 v.*
             FROM alerts a
@@ -6036,7 +6677,13 @@ def daily_report(hour_offset: int = 24) -> dict[str, Any]:
             SELECT COUNT(*) AS n
             FROM alerts a
             JOIN vulnerabilities v ON v.id = a.vulnerability_id
-            WHERE a.status='new' AND v.source NOT IN ('doonsec_wechat')
+            WHERE a.status IN ('new', 'read') AND v.source NOT IN ('doonsec_wechat')
+        """).fetchone()["n"]
+        read_alerts = conn.execute("""
+            SELECT COUNT(*) AS n
+            FROM alerts a
+            JOIN vulnerabilities v ON v.id = a.vulnerability_id
+            WHERE a.status='read' AND v.source NOT IN ('doonsec_wechat')
         """).fetchone()["n"]
         analysis_done = conn.execute("""
             SELECT COUNT(*) AS n FROM vulnerabilities
@@ -6058,6 +6705,7 @@ def daily_report(hour_offset: int = 24) -> dict[str, Any]:
         "followed_product_matches": [dict(row) for row in followed_matches],
         "new_alerts": new_alerts,
         "pending_alerts": pending_alerts,
+        "read_alerts": read_alerts,
         "analysis_completed": analysis_done,
         "analysis_failed": analysis_failed,
         "new_products": new_products,
@@ -6908,9 +7556,8 @@ def list_rag_notes(scope: str = "", query: str = "", limit: int = 50, offset: in
         clauses.append("scope=?")
         args.append(scope)
     if query:
-        like = f"%{query}%"
-        clauses.append("(title LIKE ? OR content LIKE ? OR tags LIKE ? OR related_key LIKE ?)")
-        args.extend([like, like, like, like])
+        clauses.append(_ci_like_clause(["title", "content", "tags", "related_key"]))
+        args.extend([_ci_like(query)] * 4)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with connection() as conn:
         total = conn.execute(f"SELECT COUNT(*) AS total FROM rag_notes {where}", args).fetchone()["total"]

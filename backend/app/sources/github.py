@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
@@ -30,16 +31,14 @@ class GitHubSecurityAdvisoriesAdapter(SourceAdapter):
             follow_redirects=True,
             headers=headers,
         ) as client:
-            for page in range(1, settings.github_advisory_max_pages + 1):
-                response = await client.get(
-                    self.url,
-                    params={
-                        "per_page": settings.github_advisory_page_size,
-                        "page": page,
-                        "sort": "updated",
-                        "direction": "desc",
-                    },
-                )
+            next_url = self.url
+            params: dict[str, Any] | None = {
+                "per_page": settings.github_advisory_page_size,
+                "sort": "updated",
+                "direction": "desc",
+            }
+            for _ in range(settings.github_advisory_max_pages):
+                response = await client.get(next_url, params=params)
                 if response.status_code == 403:
                     self.last_warning = _github_rate_warning(response)
                     break
@@ -48,7 +47,51 @@ class GitHubSecurityAdvisoriesAdapter(SourceAdapter):
                 if not isinstance(advisories, list) or not advisories:
                     break
                 items.extend(_advisory_item(self, advisory) for advisory in advisories if isinstance(advisory, dict))
+                next_link = response.links.get("next", {}).get("url")
+                if not next_link:
+                    break
+                next_url = next_link
+                params = None
         return items
+
+    async def fetch_advisory(self, identifier: str) -> list[dict[str, Any]]:
+        self.last_warning = ""
+        value = str(identifier or "").strip()
+        if not value:
+            raise ValueError("GitHub Advisory 编号不能为空")
+        headers = _github_headers()
+        async with httpx.AsyncClient(
+            timeout=settings.github_search_timeout_seconds,
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            if re.fullmatch(r"GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}", value, flags=re.I):
+                response = await client.get(f"{self.url}/{value}")
+                if response.status_code == 404:
+                    return []
+                if response.status_code == 403:
+                    self.last_warning = _github_rate_warning(response)
+                    return []
+                response.raise_for_status()
+                advisory = response.json()
+                return [_advisory_item(self, advisory)] if isinstance(advisory, dict) else []
+            if re.fullmatch(r"CVE-\d{4}-\d{4,}", value, flags=re.I):
+                response = await client.get(
+                    self.url,
+                    params={
+                        "cve_id": value.upper(),
+                        "per_page": settings.github_advisory_page_size,
+                        "sort": "updated",
+                        "direction": "desc",
+                    },
+                )
+                if response.status_code == 403:
+                    self.last_warning = _github_rate_warning(response)
+                    return []
+                response.raise_for_status()
+                advisories = response.json()
+                return [_advisory_item(self, advisory) for advisory in advisories if isinstance(advisory, dict)]
+        raise ValueError("只支持 GHSA-xxxx-xxxx-xxxx 或 CVE-YYYY-NNNN 格式")
 
 
 def _github_headers(*, text_matches: bool = False) -> dict[str, str]:

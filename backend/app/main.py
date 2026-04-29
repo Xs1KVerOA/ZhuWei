@@ -64,6 +64,7 @@ from .product_resolution import backfill_products_direct, schedule_deepseek_flas
 from .scheduler import list_jobs, start_scheduler, stop_scheduler
 from .services import source_service
 from .source_archive import (
+    create_latest_source_archive_request,
     create_source_archive_from_stream,
     delete_source_archive,
     retry_minio_upload,
@@ -80,8 +81,9 @@ from .update_manager import (
 )
 
 
-app = FastAPI(title="烛微 ZhuWei")
 logger = logging.getLogger("zhuwei")
+FRONTEND_BUILD_VERSION = "20260428-analysis-source"
+app = FastAPI(title="烛微 ZhuWei")
 
 
 @app.on_event("startup")
@@ -118,7 +120,10 @@ async def protect_frontend_and_api(request: Request, call_next):
     if path == "/app" or path.startswith("/assets/") or path.startswith("/proxy/"):
         if not request_is_authenticated(request):
             next_path = path + (f"?{request.url.query}" if request.url.query else "")
-            return RedirectResponse(url=f"/login?next={quote(next_path, safe='')}", status_code=302)
+            return RedirectResponse(
+                url=f"/login?next={quote(next_path, safe='')}&v={FRONTEND_BUILD_VERSION}",
+                status_code=302,
+            )
     return await call_next(request)
 
 
@@ -126,12 +131,15 @@ async def protect_frontend_and_api(request: Request, call_next):
 async def root(request: Request):
     if request_is_authenticated(request):
         return RedirectResponse(url="/app", status_code=302)
-    return RedirectResponse(url="/login", status_code=302)
+    return RedirectResponse(url=f"/login?v={FRONTEND_BUILD_VERSION}", status_code=302)
 
 
 @app.get("/login")
 async def login_page():
-    return FileResponse(settings.frontend_dir / "login.html")
+    return FileResponse(
+        settings.frontend_dir / "login.html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _frontend_file(base_dir: Path, asset_path: str) -> Path:
@@ -156,7 +164,10 @@ async def brand_asset(asset_path: str):
 
 @app.get("/app")
 async def app_page():
-    return FileResponse(settings.frontend_dir / "index.html")
+    return FileResponse(
+        settings.frontend_dir / "index.html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/assets/{asset_path:path}")
@@ -410,6 +421,20 @@ async def upload_source_archive(request: Request, _: None = Depends(require_auth
     return {"status": "queued", "data": _public_source_archive(archive)}
 
 
+@app.post("/api/source-archives/fetch-latest")
+async def fetch_latest_source_archive(payload: dict, _: None = Depends(require_auth)):
+    try:
+        archive = await run_blocking(
+            create_latest_source_archive_request,
+            product_name=str(payload.get("product_name") or ""),
+            product_key_value=str(payload.get("product_key") or ""),
+            repo_url=str(payload.get("repo_url") or ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "queued", "data": _public_source_archive(archive)}
+
+
 @app.get("/api/source-archives/{archive_id}")
 async def get_source_archive(archive_id: int, _: None = Depends(require_auth)):
     archive = await run_blocking(db.get_source_archive, archive_id)
@@ -651,6 +676,23 @@ async def run_source(name: str, _: None = Depends(require_auth)):
     if name not in source_service.adapters:
         raise HTTPException(status_code=404, detail="unknown source")
     return await source_service.run_source(name, force=True)
+
+
+@app.post("/api/sources/github-advisories/backfill")
+async def backfill_github_advisory(payload: dict, _: None = Depends(require_auth)):
+    identifier = str(
+        payload.get("identifier")
+        or payload.get("id")
+        or payload.get("ghsa_id")
+        or payload.get("cve_id")
+        or ""
+    ).strip()
+    if not identifier:
+        raise HTTPException(status_code=400, detail="identifier is required")
+    result = await source_service.backfill_github_advisory(identifier)
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=400, detail=result.get("error") or "backfill failed")
+    return result
 
 
 @app.get("/api/source-sessions/avd")
@@ -1133,8 +1175,8 @@ async def get_alerts(
     offset: int = 0,
     _: None = Depends(require_auth),
 ):
-    if status not in {"", "new", "acknowledged"}:
-        raise HTTPException(status_code=400, detail="status must be new or acknowledged")
+    if status not in {"", "new", "read", "acknowledged"}:
+        raise HTTPException(status_code=400, detail="status must be new, read or acknowledged")
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     filters = await run_blocking(current_alert_filters)
@@ -1153,6 +1195,13 @@ async def get_alerts(
 @app.post("/api/alerts/{alert_id}/ack")
 async def ack_alert(alert_id: int, _: None = Depends(require_auth)):
     if not await run_blocking(db.acknowledge_alert, alert_id):
+        raise HTTPException(status_code=404, detail="alert not found")
+    return {"status": "ok"}
+
+
+@app.post("/api/alerts/{alert_id}/read")
+async def read_alert(alert_id: int, _: None = Depends(require_auth)):
+    if not await run_blocking(db.mark_alert_read, alert_id):
         raise HTTPException(status_code=404, detail="alert not found")
     return {"status": "ok"}
 
@@ -1224,8 +1273,8 @@ async def get_scored_alerts(
     offset: int = 0,
     _: None = Depends(require_auth),
 ):
-    if status not in {"", "new", "acknowledged"}:
-        raise HTTPException(status_code=400, detail="status must be new or acknowledged")
+    if status not in {"", "new", "read", "acknowledged"}:
+        raise HTTPException(status_code=400, detail="status must be new, read or acknowledged")
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     filters = await run_blocking(current_alert_filters)

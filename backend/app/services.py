@@ -96,7 +96,9 @@ class SourceService:
                         f"产品 {product_count} 个，"
                         f"{'新增告警 ' + str(alert_count) + ' 条' if alert_enabled else '告警已跳过'}，"
                         f"触发分析 {analysis_count} 条，"
-                        f"产品归属 {product_alignment.get('linked', 0)} 条，"
+                        f"产品归属新增 {product_alignment.get('linked', 0)} 条，"
+                        f"更新 {product_alignment.get('updated', 0)} 条，"
+                        f"清洗 {product_alignment.get('cleaned', 0)} 条，"
                         f"GitHub 证据刷新 {github_evidence.get('checked', 0)} 条。"
                         f"{chr(10) + source_warning if source_warning else ''}"
                         f"{github_warning_text}"
@@ -144,6 +146,84 @@ class SourceService:
                 raw={"source": name, "run_id": run_id, "error": error},
             )
             return {"source": name, "status": "failed", "item_count": 0, "error": error}
+        finally:
+            lock.release()
+
+    async def backfill_github_advisory(self, identifier: str) -> dict[str, Any]:
+        name = "github_advisories"
+        adapter = self.adapters.get(name)
+        if adapter is None or not hasattr(adapter, "fetch_advisory"):
+            raise KeyError("github_advisories source is unavailable")
+        lock = self._locks[name]
+        if not lock.acquire(blocking=False):
+            return {"source": name, "status": "skipped", "item_count": 0, "error": "source already running"}
+
+        run_id = 0
+        try:
+            run_id = await run_blocking(db.create_run, name)
+            items = await adapter.fetch_advisory(identifier)  # type: ignore[attr-defined]
+            items = await enrich_items(items)
+            count = await run_blocking(db.upsert_vulnerabilities, items) if items else 0
+            product_alignment = await run_blocking(resolve_products_direct, items) if items else {
+                "checked": 0,
+                "linked": 0,
+                "created_products": 0,
+            }
+            analysis_count = await run_blocking(queue_followed_analysis_for_items, items) if items else 0
+            source_warning = str(getattr(adapter, "last_warning", "") or "")
+            run_status = "partial" if source_warning else "success"
+            result_status = "not_found" if not items and not source_warning else run_status
+            await run_blocking(db.finish_run, run_id, name, run_status, count, source_warning)
+            title = "GitHub Advisory 回补完成" if items else "GitHub Advisory 未找到"
+            await run_blocking(
+                db.create_message,
+                level="warning" if source_warning or not items else "success",
+                category="source",
+                title=title,
+                body=(
+                    f"{identifier} 回补入库 {count} 条，"
+                    f"产品归属 {product_alignment.get('linked', 0)} 条，"
+                    f"触发分析 {analysis_count} 条。"
+                    f"{chr(10) + source_warning if source_warning else ''}"
+                ),
+                entity_type="source",
+                entity_id=name,
+                raw={
+                    "source": name,
+                    "run_id": run_id,
+                    "identifier": identifier,
+                    "item_count": count,
+                    "product_alignment": product_alignment,
+                    "analysis_count": analysis_count,
+                    "warning": source_warning,
+                    "matched": [item.get("source_uid") for item in items],
+                },
+            )
+            return {
+                "source": name,
+                "status": result_status,
+                "identifier": identifier,
+                "item_count": count,
+                "product_alignment": product_alignment,
+                "analysis_count": analysis_count,
+                "matched": [item.get("source_uid") for item in items],
+                "error": source_warning,
+            }
+        except Exception as exc:
+            error = str(exc)
+            if run_id:
+                await run_blocking(db.finish_run, run_id, name, "failed", 0, error)
+            await run_blocking(
+                db.create_message,
+                level="error",
+                category="source",
+                title="GitHub Advisory 回补失败",
+                body=f"{identifier} 回补失败：{error[:2000]}",
+                entity_type="source",
+                entity_id=name,
+                raw={"source": name, "run_id": run_id, "identifier": identifier, "error": error},
+            )
+            return {"source": name, "status": "failed", "identifier": identifier, "item_count": 0, "error": error}
         finally:
             lock.release()
 
