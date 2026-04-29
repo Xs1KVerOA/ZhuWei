@@ -383,6 +383,8 @@ def _analysis_model_profile_for_vuln(vuln: dict[str, Any]) -> dict[str, Any]:
 
 
 def _analysis_mode_label(model_profile: dict[str, Any]) -> str:
+    if model_profile.get("existing_source_audit_mode"):
+        return "已有源码审计"
     if _is_red_team_profile(model_profile):
         return "红队增强"
     return "标准分析"
@@ -393,6 +395,8 @@ def _is_red_team_profile(model_profile: dict[str, Any]) -> bool:
 
 
 def _analysis_allows_source_fetch(model_profile: dict[str, Any]) -> bool:
+    if model_profile.get("existing_source_audit_mode"):
+        return False
     return not _is_red_team_profile(model_profile)
 
 
@@ -400,6 +404,24 @@ def _analysis_allowed_tools(model_profile: dict[str, Any]) -> str:
     allowed = str(settings.vulnerability_analysis_allowed_tools or "").strip()
     if _analysis_allows_source_fetch(model_profile):
         return allowed
+    if model_profile.get("existing_source_audit_mode"):
+        blocked_prefixes = (
+            "Bash(git clone:",
+            "Bash(gh repo clone:",
+            "Bash(git ls-remote:",
+            "Bash(npm view:",
+            "Bash(npm pack:",
+            "Bash(python -m pip download:",
+            "Bash(python3 -m pip download:",
+            "Bash(curl:",
+            "Bash(wget:",
+        )
+        filtered = [
+            item.strip()
+            for item in allowed.split(",")
+            if item.strip() and not item.strip().startswith(blocked_prefixes)
+        ]
+        return ",".join(filtered)
     blocked_prefixes = (
         "Bash(git clone:",
         "Bash(gh repo clone:",
@@ -418,6 +440,43 @@ def _analysis_allowed_tools(model_profile: dict[str, Any]) -> str:
         if item.strip() and not item.strip().startswith(blocked_prefixes)
     ]
     return ",".join(filtered)
+
+
+def _apply_existing_source_audit_mode(
+    model_profile: dict[str, Any],
+    existing_source_context: dict[str, Any],
+) -> dict[str, Any]:
+    if _is_red_team_profile(model_profile):
+        return model_profile
+    has_existing_source = bool(
+        existing_source_context.get("source_archive_match_count")
+        or existing_source_context.get("workspace_source_match_count")
+        or existing_source_context.get("source_found")
+    )
+    if not has_existing_source:
+        return model_profile
+    updated = dict(model_profile)
+    updated["existing_source_audit_mode"] = True
+    updated["source_acquisition_allowed"] = False
+    updated["analysis_mode"] = "existing_source_audit"
+    return updated
+
+
+def _analysis_start_message(model_profile: dict[str, Any]) -> str:
+    if model_profile.get("existing_source_audit_mode"):
+        return "启动 Claude Code CLI，进入已有源码审计模式；本轮直接读取本地源码库/历史源码，只补充公告与公开证据。"
+    if _analysis_allows_source_fetch(model_profile):
+        return "启动 Claude Code CLI，开始检索公告、源码仓库、补丁与公开分析。"
+    return "启动 Claude Code CLI，开始红队增强检索；本轮仅复用已有源码证据，不拉取源码。"
+
+
+def _analysis_process_start_message(pid: int, model_profile: dict[str, Any]) -> str:
+    base = f"Claude Code 进程已启动：pid={pid}，超时 {settings.vulnerability_analysis_timeout_seconds}s；"
+    if model_profile.get("existing_source_audit_mode"):
+        return base + "已有源码审计模式已启用，源码拉取监控关闭。"
+    if _analysis_allows_source_fetch(model_profile):
+        return base + "源码进度监控已启用。"
+    return base + "红队增强不启用源码拉取监控。"
 
 
 def _run_analysis_thread(vulnerability_id: int) -> None:
@@ -507,6 +566,7 @@ async def _run_analysis(vulnerability_id: int) -> None:
             {"workspace": str(workspace)},
         )
         existing_source_context = await asyncio.to_thread(_existing_source_context, vuln)
+        model_profile = _apply_existing_source_audit_mode(model_profile, existing_source_context)
         _analysis_event(
             vulnerability_id,
             run_id,
@@ -514,6 +574,19 @@ async def _run_analysis(vulnerability_id: int) -> None:
             _existing_source_context_message(existing_source_context),
             existing_source_context,
         )
+        if model_profile.get("existing_source_audit_mode"):
+            _analysis_event(
+                vulnerability_id,
+                run_id,
+                "source",
+                "已有源码审计模式：已命中本地源码库/历史源码，本轮直接读取现有源码做审计，不再拉取产品源码。",
+                {
+                    "source_acquisition_allowed": False,
+                    "source_archive_match_count": existing_source_context.get("source_archive_match_count", 0),
+                    "workspace_source_match_count": existing_source_context.get("workspace_source_match_count", 0),
+                    "allowed_tools_policy": "read_existing_source_only",
+                },
+            )
         prompt = _analysis_prompt(vuln, model_profile, existing_source_context)
         prompt_path = workspace / "analysis_prompt.txt"
         with contextlib.suppress(OSError):
@@ -542,11 +615,7 @@ async def _run_analysis(vulnerability_id: int) -> None:
             vulnerability_id,
             run_id,
             "stage",
-            (
-                "启动 Claude Code CLI，开始检索公告、源码仓库、补丁与公开分析。"
-                if _analysis_allows_source_fetch(model_profile)
-                else "启动 Claude Code CLI，开始红队增强检索；本轮仅复用已有源码证据，不拉取源码。"
-            ),
+            _analysis_start_message(model_profile),
             {"command": [command_path, "-p", "<prompt>", "--output-format", "json"]},
         )
         subprocess_env = claude_code_subprocess_env()
@@ -570,136 +639,177 @@ async def _run_analysis(vulnerability_id: int) -> None:
                 ),
             }
         )
-        _analysis_event(
-            vulnerability_id,
-            run_id,
-            "model",
-            (
-                "模型请求已准备："
-                f"主模型 {model}；"
-                f"Flash/轻量任务 {subprocess_env.get('ANTHROPIC_DEFAULT_HAIKU_MODEL') or '-'}；"
-                f"深度任务 {subprocess_env.get('ANTHROPIC_DEFAULT_SONNET_MODEL') or '-'}；"
-                f"允许工具 {allowed_tools}。"
-            ),
-            {
-                "model": model,
-                "model_profile": model_profile,
-                "base_url": subprocess_env.get("ANTHROPIC_BASE_URL", ""),
-                "allowed_tools": allowed_tools,
-                "workspace": str(workspace),
-            },
-        )
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=str(workspace),
-            env=subprocess_env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _analysis_event(
-            vulnerability_id,
-            run_id,
-            "stage",
-            (
-                f"Claude Code 进程已启动：pid={process.pid}，超时 {settings.vulnerability_analysis_timeout_seconds}s；源码进度监控已启用。"
-                if _analysis_allows_source_fetch(model_profile)
-                else f"Claude Code 进程已启动：pid={process.pid}，超时 {settings.vulnerability_analysis_timeout_seconds}s；红队增强不启用源码拉取监控。"
-            ),
-            {
-                "pid": process.pid,
-                "timeout_seconds": settings.vulnerability_analysis_timeout_seconds,
-                "workspace": str(workspace),
-                "source_monitor": _analysis_allows_source_fetch(model_profile),
-            },
-        )
-        source_monitor_task = (
-            asyncio.create_task(_monitor_analysis_workspace_sources(vulnerability_id, run_id, workspace))
-            if _analysis_allows_source_fetch(model_profile)
-            else None
-        )
-        try:
-            returncode, stdout_text, stderr_text = await _collect_process_output(
-                process,
+        max_attempts = 2
+        attempt = 1
+        while True:
+            _analysis_event(
                 vulnerability_id,
                 run_id,
-                workspace,
+                "model",
+                (
+                    "模型请求已准备："
+                    f"主模型 {model}；"
+                    f"Flash/轻量任务 {subprocess_env.get('ANTHROPIC_DEFAULT_HAIKU_MODEL') or '-'}；"
+                    f"深度任务 {subprocess_env.get('ANTHROPIC_DEFAULT_SONNET_MODEL') or '-'}；"
+                    f"允许工具 {allowed_tools}。"
+                ),
+                {
+                    "model": model,
+                    "model_profile": model_profile,
+                    "base_url": subprocess_env.get("ANTHROPIC_BASE_URL", ""),
+                    "allowed_tools": allowed_tools,
+                    "workspace": str(workspace),
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                },
             )
-        finally:
-            if source_monitor_task is not None:
-                source_monitor_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await source_monitor_task
-        _analysis_event(
-            vulnerability_id,
-            run_id,
-            "stage",
-            "模型原始 stdout/stderr 已保存到工作目录，可用于复盘模型对话与工具调用。",
-            {
-                "stdout_path": str(workspace / "model_stdout.log"),
-                "stderr_path": str(workspace / "model_stderr.log"),
-                "stdout_length": len(stdout_text),
-                "stderr_length": len(stderr_text),
-            },
-        )
-        stdout_failure = _claude_result_failure(stdout_text, stderr_text)
-        if stdout_failure:
-            recovered = _workspace_analysis_result(workspace)
-            if recovered:
-                _analysis_event(
-                    vulnerability_id,
-                    run_id,
-                    "stage",
-                    "Claude Code 输出标记为模型错误，但工作目录中已发现可恢复 JSON 结果，优先回填数据库。",
-                    {
-                        "returncode": returncode,
-                        "result_file": recovered.get("_workspace_result_file", ""),
-                        "error": stdout_failure.detail[:1000],
-                    },
-                )
-                _persist_analysis_result(
-                    vulnerability_id,
-                    vuln,
-                    run_id,
-                    model,
-                    model_profile,
-                    workspace,
-                    recovered,
-                    stdout_text,
-                    stderr_text,
-                    recovered_from="model_error_workspace_result",
-                )
-                return
-            raise stdout_failure
-        if returncode != 0:
-            recovered = _workspace_analysis_result(workspace)
-            if recovered:
-                _analysis_event(
-                    vulnerability_id,
-                    run_id,
-                    "stage",
-                    "Claude Code 进程返回非 0，但工作目录中已发现可恢复 JSON 结果，优先回填数据库。",
-                    {
-                        "returncode": returncode,
-                        "result_file": recovered.get("_workspace_result_file", ""),
-                        "stderr_tail": stderr_text[-1000:],
-                    },
-                )
-                _persist_analysis_result(
-                    vulnerability_id,
-                    vuln,
-                    run_id,
-                    model,
-                    model_profile,
-                    workspace,
-                    recovered,
-                    stdout_text,
-                    stderr_text,
-                    recovered_from="nonzero_workspace_result",
-                )
-                return
-            raise _classify_analysis_failure(
-                stderr_text or stdout_text or f"Claude exited {returncode}"
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(workspace),
+                env=subprocess_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+            _analysis_event(
+                vulnerability_id,
+                run_id,
+                "stage",
+                _analysis_process_start_message(process.pid, model_profile),
+                {
+                    "pid": process.pid,
+                    "timeout_seconds": settings.vulnerability_analysis_timeout_seconds,
+                    "workspace": str(workspace),
+                    "source_monitor": _analysis_allows_source_fetch(model_profile),
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                },
+            )
+            source_monitor_task = (
+                asyncio.create_task(_monitor_analysis_workspace_sources(vulnerability_id, run_id, workspace))
+                if _analysis_allows_source_fetch(model_profile)
+                else None
+            )
+            try:
+                returncode, stdout_text, stderr_text = await _collect_process_output(
+                    process,
+                    vulnerability_id,
+                    run_id,
+                    workspace,
+                )
+            finally:
+                if source_monitor_task is not None:
+                    source_monitor_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await source_monitor_task
+            _analysis_event(
+                vulnerability_id,
+                run_id,
+                "stage",
+                "模型原始 stdout/stderr 已保存到工作目录，可用于复盘模型对话与工具调用。",
+                {
+                    "stdout_path": str(workspace / "model_stdout.log"),
+                    "stderr_path": str(workspace / "model_stderr.log"),
+                    "stdout_length": len(stdout_text),
+                    "stderr_length": len(stderr_text),
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                },
+            )
+            stdout_failure = _claude_result_failure(stdout_text, stderr_text)
+            if stdout_failure:
+                recovered = _workspace_analysis_result(workspace)
+                if recovered:
+                    _analysis_event(
+                        vulnerability_id,
+                        run_id,
+                        "stage",
+                        "Claude Code 输出标记为模型错误，但工作目录中已发现可恢复 JSON 结果，优先回填数据库。",
+                        {
+                            "returncode": returncode,
+                            "result_file": recovered.get("_workspace_result_file", ""),
+                            "error": stdout_failure.detail[:1000],
+                            "attempt": attempt,
+                        },
+                    )
+                    _persist_analysis_result(
+                        vulnerability_id,
+                        vuln,
+                        run_id,
+                        model,
+                        model_profile,
+                        workspace,
+                        recovered,
+                        stdout_text,
+                        stderr_text,
+                        recovered_from="model_error_workspace_result",
+                    )
+                    return
+                if _should_retry_model_source_failure(stdout_failure, attempt, max_attempts):
+                    vuln, attempt = await _prepare_model_source_retry(
+                        vulnerability_id,
+                        vuln,
+                        run_id,
+                        model,
+                        model_profile,
+                        workspace,
+                        prompt_path,
+                        command,
+                        stdout_failure,
+                        stdout_text,
+                        attempt,
+                        max_attempts,
+                    )
+                    continue
+                raise stdout_failure
+            if returncode != 0:
+                recovered = _workspace_analysis_result(workspace)
+                if recovered:
+                    _analysis_event(
+                        vulnerability_id,
+                        run_id,
+                        "stage",
+                        "Claude Code 进程返回非 0，但工作目录中已发现可恢复 JSON 结果，优先回填数据库。",
+                        {
+                            "returncode": returncode,
+                            "result_file": recovered.get("_workspace_result_file", ""),
+                            "stderr_tail": stderr_text[-1000:],
+                            "attempt": attempt,
+                        },
+                    )
+                    _persist_analysis_result(
+                        vulnerability_id,
+                        vuln,
+                        run_id,
+                        model,
+                        model_profile,
+                        workspace,
+                        recovered,
+                        stdout_text,
+                        stderr_text,
+                        recovered_from="nonzero_workspace_result",
+                    )
+                    return
+                process_failure = _classify_analysis_failure(
+                    stderr_text or stdout_text or f"Claude exited {returncode}"
+                )
+                if _should_retry_model_source_failure(process_failure, attempt, max_attempts):
+                    vuln, attempt = await _prepare_model_source_retry(
+                        vulnerability_id,
+                        vuln,
+                        run_id,
+                        model,
+                        model_profile,
+                        workspace,
+                        prompt_path,
+                        command,
+                        process_failure,
+                        stdout_text,
+                        attempt,
+                        max_attempts,
+                    )
+                    continue
+                raise process_failure
+            break
 
         _check_analysis_canceled(vulnerability_id)
         _analysis_event(vulnerability_id, run_id, "stage", "模型输出已返回，开始解析 JSON 结果。")
@@ -909,6 +1019,55 @@ def _persist_analysis_result(
         "poc_validation": poc_status,
         "exp_validation": exp_status,
     }
+    component_impacts: list[dict[str, Any]] = []
+    redteam_workbench: dict[str, Any] | None = None
+    source_diff_record: dict[str, Any] | None = None
+    try:
+        component_impacts = db.refresh_vulnerability_component_impacts(vulnerability_id, parsed)
+        if component_impacts:
+            _analysis_event(
+                vulnerability_id,
+                run_id,
+                "source",
+                f"影响组件展开：已生成 {len(component_impacts)} 条企业源码/SBOM 命中证据。",
+                {"component_impacts": component_impacts[:20]},
+            )
+    except Exception:
+        logger.warning("failed to persist component impacts for vulnerability %s", vulnerability_id, exc_info=True)
+    try:
+        workbench_payload = _redteam_workbench_payload(parsed, vuln, poc_content, exp_content)
+        if workbench_payload:
+            redteam_workbench = db.upsert_redteam_workbench(vulnerability_id, workbench_payload)
+            _analysis_event(
+                vulnerability_id,
+                run_id,
+                "exp",
+                "红队验证工作台：已生成环境、版本、入口点、参数、前置条件和失败记录模板。",
+                {"redteam_workbench": redteam_workbench},
+            )
+    except Exception:
+        logger.warning("failed to persist redteam workbench for vulnerability %s", vulnerability_id, exc_info=True)
+    try:
+        source_diff_payload = _source_diff_payload_from_parsed(
+            vulnerability_id,
+            vuln,
+            parsed,
+            [*source_artifacts, source_artifact],
+        )
+        if source_diff_payload:
+            source_diff_record = db.create_source_diff_analysis(source_diff_payload)
+            _analysis_event(
+                vulnerability_id,
+                run_id,
+                "source",
+                "源码版本 Diff 分析：已写入 affected/fixed/latest 对比摘要。",
+                {"source_diff_analysis": source_diff_record},
+            )
+    except Exception:
+        logger.warning("failed to persist source diff analysis for vulnerability %s", vulnerability_id, exc_info=True)
+    raw["component_impacts_count"] = len(component_impacts)
+    raw["redteam_workbench_status"] = (redteam_workbench or {}).get("status", "")
+    raw["source_diff_analysis_id"] = (source_diff_record or {}).get("id", 0)
     if recovered_from:
         raw["recovered_from"] = recovered_from
     updated = db.finish_vulnerability_analysis(
@@ -1010,6 +1169,126 @@ def _persist_analysis_result(
     return updated
 
 
+def _redteam_workbench_payload(
+    parsed: dict[str, Any],
+    vuln: dict[str, Any],
+    poc_content: str,
+    exp_content: str,
+) -> dict[str, Any]:
+    for key in ["red_team_workbench", "redteam_workbench", "red_team_validation", "validation_workbench"]:
+        value = parsed.get(key)
+        if isinstance(value, dict) and any(value.values()):
+            return value
+    assessment = parsed.get("source_version_assessment") if isinstance(parsed.get("source_version_assessment"), dict) else {}
+    public_items = parsed.get("public_poc_exp") if isinstance(parsed.get("public_poc_exp"), list) else []
+    source_analysis = str(parsed.get("source_analysis") or "").strip()
+    attack_surface = str(parsed.get("attack_surface") or "").strip()
+    root_cause = str(parsed.get("root_cause") or "").strip()
+    summary = str(parsed.get("summary") or vuln.get("analysis_summary") or "").strip()
+    if not any([assessment, public_items, source_analysis, attack_surface, root_cause, poc_content, exp_content, summary]):
+        return {}
+    version_line = "；".join(
+        [
+            f"告警范围 {assessment.get('alert_affected_versions') or '-'}",
+            f"本地源码 {assessment.get('local_source_version') or '-'}",
+            f"匹配结论 {assessment.get('match') or 'unknown'}",
+        ]
+    )
+    public_evidence = [
+        f"{item.get('kind') or 'poc'}：{item.get('title') or item.get('url') or '-'}，验证 {item.get('validation') or '-'}"
+        for item in public_items
+        if isinstance(item, dict)
+    ][:8]
+    return {
+        "status": "ready",
+        "environment_setup": [
+            "仅在内部授权、隔离或靶场环境复现，不面向公网目标执行。",
+            "优先使用企业本地源码库命中的 affected/fixed/latest 版本，缺失版本再补公开公告证据。",
+        ],
+        "version_confirmation": [version_line] if version_line.strip("；- ") else [],
+        "entrypoints": [attack_surface or source_analysis][:1],
+        "request_parameters": [
+            text
+            for text in [
+                str((parsed.get("poc_validation") or {}).get("evidence") or "").strip()
+                if isinstance(parsed.get("poc_validation"), dict)
+                else "",
+                str((parsed.get("exp_validation") or {}).get("evidence") or "").strip()
+                if isinstance(parsed.get("exp_validation"), dict)
+                else "",
+            ]
+            if text
+        ],
+        "poc_prerequisites": public_evidence or ["需要先完成版本、入口点和前置配置确认。"],
+        "exploit_chain": [
+            item
+            for item in [
+                "阶段 1：监听漏洞情报并确认产品/组件归属。",
+                "阶段 2：优先检索企业本地源码与依赖库，确认版本命中。",
+                root_cause and f"阶段 3：定位根因与触发路径：{root_cause[:600]}",
+                "阶段 4：在授权环境执行非破坏性 POC 验证并记录失败原因。",
+            ]
+            if item
+        ],
+        "failure_notes": [
+            "源码版本不在受影响范围、入口点不可达、依赖未启用、鉴权/配置条件不满足时，应标记为复现失败并保留证据。",
+        ],
+        "reproduction_report": summary[:4000],
+        "raw": {"generated_from": "analysis_result", "poc_length": len(poc_content), "exp_length": len(exp_content)},
+    }
+
+
+def _source_diff_payload_from_parsed(
+    vulnerability_id: int,
+    vuln: dict[str, Any],
+    parsed: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    diff = parsed.get("source_diff_analysis") if isinstance(parsed.get("source_diff_analysis"), dict) else {}
+    if not diff:
+        return {}
+    summary = str(diff.get("diff_summary") or diff.get("summary") or "").strip()
+    key_changes = diff.get("key_function_changes") or diff.get("function_changes") or []
+    fix_points = diff.get("fix_points") or diff.get("fixes") or []
+    similar = diff.get("similar_patterns") or []
+    if not any([summary, key_changes, fix_points, diff.get("exploit_condition_backtrace"), diff.get("bypass_risk"), similar]):
+        return {}
+    role_ids = _source_archive_ids_by_role(artifacts)
+    attribution = parsed.get("product_attribution") if isinstance(parsed.get("product_attribution"), dict) else {}
+    product_name = str(attribution.get("product") or vuln.get("product") or "").strip()
+    product_key = db.product_key(product_name) if product_name else db.product_key_for_item(vuln)
+    return {
+        "vulnerability_id": vulnerability_id,
+        "product_key": product_key,
+        "product_name": product_name,
+        "affected_archive_id": role_ids.get("affected") or role_ids.get("uploaded") or 0,
+        "fixed_archive_id": role_ids.get("fixed") or 0,
+        "latest_archive_id": role_ids.get("latest") or 0,
+        "status": "finished",
+        "summary": summary,
+        "key_function_changes": key_changes,
+        "fix_points": fix_points,
+        "exploit_condition_backtrace": diff.get("exploit_condition_backtrace") or "",
+        "bypass_risk": diff.get("bypass_risk") or "",
+        "similar_patterns": similar,
+        "evidence": diff.get("evidence") or diff.get("compared_versions") or [],
+        "agent_model": "analysis-agent",
+        "raw": diff,
+    }
+
+
+def _source_archive_ids_by_role(artifacts: list[dict[str, Any]]) -> dict[str, int]:
+    role_ids: dict[str, int] = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        archive_id = int(artifact.get("source_archive_id") or 0)
+        role = _normalize_source_version_role(artifact.get("version_role"))
+        if archive_id and role and role not in role_ids:
+            role_ids[role] = archive_id
+    return role_ids
+
+
 async def _collect_process_output(
     process: asyncio.subprocess.Process,
     vulnerability_id: int,
@@ -1089,6 +1368,114 @@ def _workspace_stream_text(workspace: Path | None, stream_name: str) -> str:
         return (workspace / f"model_{stream_name}.log").read_text(encoding="utf-8")
     except OSError:
         return ""
+
+
+def _should_retry_model_source_failure(
+    failure: AnalysisFailure,
+    attempt: int,
+    max_attempts: int,
+) -> bool:
+    if attempt >= max_attempts:
+        return False
+    if failure.reason != "模型源异常":
+        return False
+    return _is_transient_model_source_error(failure.detail)
+
+
+def _is_transient_model_source_error(text: str) -> bool:
+    lower = (text or "").lower()
+    compact = re.sub(r"[\s_-]+", "", lower)
+    markers = [
+        "unable to connect to api",
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "remote disconnected",
+        "socket hang up",
+        "network error",
+        "temporary failure",
+        "timeout",
+        "timed out",
+        "econnrefused",
+        "enotfound",
+        "eai_again",
+        "etimedout",
+        "connectionrefused",
+        "unabletoconnecttoapi",
+    ]
+    return any(marker in lower or marker in compact for marker in markers)
+
+
+async def _prepare_model_source_retry(
+    vulnerability_id: int,
+    vuln: dict[str, Any],
+    run_id: str,
+    model: str,
+    model_profile: dict[str, Any],
+    workspace: Path,
+    prompt_path: Path,
+    command: list[str],
+    failure: AnalysisFailure,
+    stdout_text: str,
+    attempt: int,
+    max_attempts: int,
+) -> tuple[dict[str, Any], int]:
+    db.record_claude_model_usage(
+        task_type="deep_analysis",
+        default_model=model,
+        stdout_text=stdout_text,
+        status="retrying",
+        raw={
+            "run_id": run_id,
+            "vulnerability_id": vulnerability_id,
+            "attempt": attempt,
+            "reason": failure.reason,
+        },
+    )
+    for stream_name in ["stdout", "stderr"]:
+        path = workspace / f"model_{stream_name}.log"
+        if path.exists():
+            with contextlib.suppress(OSError):
+                shutil.copyfile(path, workspace / f"model_{stream_name}_attempt{attempt}.log")
+    next_attempt = attempt + 1
+    delay_seconds = 8
+    _analysis_event(
+        vulnerability_id,
+        run_id,
+        "error",
+        (
+            "模型源连接异常，已保留当前工作目录和已发现源码；"
+            f"{delay_seconds}s 后自动重试第 {next_attempt}/{max_attempts} 次。"
+        ),
+        {
+            "attempt": attempt,
+            "next_attempt": next_attempt,
+            "max_attempts": max_attempts,
+            "detail": failure.detail[:1000],
+        },
+    )
+    await asyncio.sleep(delay_seconds)
+    _check_analysis_canceled(vulnerability_id)
+    latest_vuln = db.get_vulnerability(vulnerability_id) or vuln
+    existing_source_context = await asyncio.to_thread(_existing_source_context, latest_vuln)
+    model_profile = _apply_existing_source_audit_mode(model_profile, existing_source_context)
+    refreshed_prompt = _analysis_prompt(latest_vuln, model_profile, existing_source_context)
+    if len(command) >= 3:
+        command[2] = refreshed_prompt
+    if "--allowedTools" in command:
+        index = command.index("--allowedTools")
+        if index + 1 < len(command):
+            command[index + 1] = _analysis_allowed_tools(model_profile)
+    with contextlib.suppress(OSError):
+        prompt_path.write_text(refreshed_prompt, encoding="utf-8")
+    _analysis_event(
+        vulnerability_id,
+        run_id,
+        "source",
+        _existing_source_context_message(existing_source_context),
+        {"attempt": next_attempt, **existing_source_context},
+    )
+    return latest_vuln, next_attempt
 
 
 async def _monitor_analysis_workspace_sources(vulnerability_id: int, run_id: str, workspace: Path) -> None:
@@ -1655,6 +2042,19 @@ def _classify_analysis_failure(text: str) -> AnalysisFailure:
         "401",
         "403",
         "model",
+        "模型源",
+        "unable to connect to api",
+        "connection refused",
+        "connectionrefused",
+        "econnrefused",
+        "connection reset",
+        "network error",
+        "socket hang up",
+        "remote disconnected",
+        "temporary failure",
+        "enotfound",
+        "eai_again",
+        "etimedout",
     ]
     if any(marker in lower for marker in model_markers):
         return AnalysisFailure("模型源异常", detail)
@@ -1830,6 +2230,7 @@ def _existing_source_context(vuln: dict[str, Any]) -> dict[str, Any]:
         "workspace_source_match_count": len(workspace_artifacts),
         "source_archive_roles": archive_roles,
         "has_latest_source": any(str(item.get("version_role") or "") == "latest" for item in all_source_artifacts),
+        "has_fixed_source": any(str(item.get("version_role") or "") == "fixed" for item in all_source_artifacts),
         "has_affected_source": any(str(item.get("version_role") or "") in {"affected", "uploaded", "unknown"} for item in all_source_artifacts),
         "retained_until": str(vuln.get("analysis_source_retained_until") or "").strip(),
         "cleaned_at": str(vuln.get("analysis_source_cleaned_at") or "").strip(),
@@ -1844,7 +2245,7 @@ def _existing_source_context_message(context: dict[str, Any]) -> str:
     roles = context.get("source_archive_roles") if isinstance(context.get("source_archive_roles"), dict) else {}
     role_text = "，".join(
         f"{label} {roles.get(role)}"
-        for role, label in [("affected", "受影响"), ("latest", "最新"), ("uploaded", "上传"), ("unknown", "未知")]
+        for role, label in [("affected", "受影响"), ("fixed", "修复"), ("latest", "最新"), ("uploaded", "上传"), ("unknown", "未知")]
         if int(roles.get(role) or 0) > 0
     )
     if count:
@@ -2005,7 +2406,7 @@ def _matching_source_archive_artifacts(vuln: dict[str, Any]) -> list[dict[str, A
         ):
             continue
         artifacts.append(_source_archive_artifact_from_row(row, path))
-    role_order = {"affected": 0, "uploaded": 1, "latest": 2, "unknown": 3}
+    role_order = {"affected": 0, "uploaded": 1, "fixed": 2, "latest": 3, "unknown": 4}
     artifacts.sort(
         key=lambda item: (
             role_order.get(str(item.get("version_role") or "unknown"), 9),
@@ -2122,8 +2523,38 @@ def _two_stage_prompt(payload: dict[str, Any], model_profile: dict[str, Any], re
 
 
 def _standard_vulnerability_analysis_prompt(payload: dict[str, Any], model_profile: dict[str, Any]) -> str:
+    existing_source_audit = bool(model_profile.get("existing_source_audit_mode"))
+    poc_fetch_rule = (
+        "如果发现公开 POC/EXP 仓库或脚本，只能通过 WebFetch/WebSearch 阅读公开页面或仓库文件内容；本轮禁止 git clone、curl、npm pack、pip download 下载任何仓库、源码包或脚本。"
+        if existing_source_audit
+        else "如果发现公开 POC/EXP 仓库或脚本，可以在当前工作目录使用 git clone、curl、npm pack、pip download 下载，只阅读必要文件。"
+    )
+    source_fetch_policy = (
+        """
+已有源码审计强约束：
+1. `existing_local_source.source_found=true` 表示企业本地源码库或历史分析工作目录已命中，本轮必须直接读取这些本地源码路径进行源码审计。
+2. 禁止拉取或下载新的产品源码、补丁源码、npm/pip 源码包或 Git 仓库；不要执行 git clone、npm pack、pip download、curl/wget 下载源码。
+3. 可以使用 Read、rg、find、ls、sed、head、tail、cat 等方式审计 `existing_local_source.artifacts`、`source_archive_matches`、`workspace_source_matches` 中的源码。
+4. 如果需要公开信息，只用 WebSearch/WebFetch 补充公告、版本范围、修复说明和公开 POC/EXP 证据；公开信息必须服务于本地源码审计结论。
+5. 如果现有源码缺少某个版本，不要下载补齐；在 `source_version_assessment.needs_online_source` 标记 true，并说明缺口。
+""".strip()
+        if existing_source_audit
+        else """
+源码拉取策略：
+1. 如果 `existing_local_source.source_found=true`，优先读取 `existing_local_source.local_path` 和 `existing_local_source.artifacts` 中的本地路径；如果展开目录已清理但 `archive_path` 存在，可以先解压到当前工作目录的临时目录再读取。不要在完成本地判断前搜索现网源码。
+2. 如果 `existing_local_source.source_archive_matches` 中已有匹配源码，必须直接复用这些源码；同一产品、同一 `version_role` 或同一版本不得再次 git clone、npm pack 或 pip download。
+3. 若缺少受影响版本源码且确实需要读代码，可以现网拉取该受影响版本源码；下载目录名应包含 affected/vulnerable/old 等语义。
+4. 漏洞分析可以为根因与修复判断下载补丁相关源码或修复版本源码；如果下载的是修复版本，目录名应包含 fixed/patched 等语义并设置 `version_role=fixed`；如果下载的是最新版本，目录名应包含 latest/current 等语义并设置 `version_role=latest`。
+5. 完整的大范围版本差异仍由源码库“拉取最新版本”按钮承接；本轮只下载完成漏洞根因、POC/EXP 可用性和修复版本判断所必需的源码。
+""".strip()
+    )
+    opening = (
+        "你是企业防御侧漏洞源码审计助手。当前漏洞已命中企业本地源码库或历史源码，本轮任务是直接审计已有源码，结合公告与公开 POC/EXP 证据形成源码证据链；禁止拉取新的产品源码。"
+        if existing_source_audit
+        else "你是企业防御侧漏洞分析助手。请严格按顺序完成下面这条漏洞的后端 LLM 深度分析。漏洞分析负责检索公告、公开 POC/EXP、源码仓库、补丁与受影响版本代码；如果源码库没有匹配源码，而根因或版本判断需要源码，请在当前工作目录下载必要的受影响版本源码或补丁相关源码，并把下载路径写入 `source_repositories.local_path`，便于系统归档到源码库。"
+    )
     return f"""
-你是企业防御侧漏洞分析助手。请严格按顺序完成下面这条漏洞的后端 LLM 深度分析。漏洞分析负责检索公告、公开 POC/EXP、源码仓库、补丁与受影响版本代码；如果源码库没有匹配源码，而根因或版本判断需要源码，请在当前工作目录下载必要的受影响版本源码或补丁相关源码，并把下载路径写入 `source_repositories.local_path`，便于系统归档到源码库。
+{opening}
 
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 
@@ -2131,23 +2562,23 @@ def _standard_vulnerability_analysis_prompt(payload: dict[str, Any], model_profi
 ### 阶段一：公开 POC/EXP 现网检索与可用性判断
 1. 使用 WebSearch/WebFetch 优先搜索：CVE ID、漏洞标题、产品名、版本号、`poc`、`exploit`、`exp`、`github`、`exploit-db`、`packet storm`、`nuclei`、`metasploit`。
 2. 覆盖 GitHub、GitLab、Exploit-DB、Packet Storm、NVD、GitHub Advisory、厂商公告、安全研究博客。
-3. 如果发现公开 POC/EXP 仓库或脚本，可以在当前工作目录使用 git clone、curl、npm pack、pip download 下载，只阅读必要文件。
+3. {poc_fetch_rule}
 4. 判断公开 POC/EXP 是否可用：必须说明证据、入口点、受影响版本、运行条件、是否只是占位/转载/误报。
 5. 没有公开 POC/EXP 时，`poc_available`/`exp_available` 必须为 false，不要把“存在标记”当成可用代码。
 
-### 阶段二：源码库优先、版本判断与源码辅助验证
-1. 如果 `existing_local_source.source_found=true`，优先读取 `existing_local_source.local_path` 和 `existing_local_source.artifacts` 中的本地路径；如果展开目录已清理但 `archive_path` 存在，可以先解压到当前工作目录的临时目录再读取。不要在完成本地判断前搜索现网源码。
-2. 如果 `existing_local_source.source_archive_matches` 中已有匹配源码，必须直接复用这些源码；同一产品、同一 `version_role` 或同一版本不得再次 git clone、npm pack 或 pip download。
-3. 从漏洞告警、NVD/CVE、厂商公告和包元数据中提取受影响版本、修复版本、组件名；从本地源码的 package.json、pom.xml、setup.py、go.mod、CHANGELOG、tag/commit 信息中提取当前源码版本。
-4. 明确输出“本地源码版本是否落在受影响范围内”：affected / fixed / unknown / mismatch。若缺少受影响版本源码且确实需要读代码，可以现网拉取该受影响版本源码；下载目录名应包含 affected/vulnerable/old 等语义。
-5. 漏洞分析可以为根因与修复判断下载补丁相关源码或修复版本源码；如果下载的是最新/修复版本，目录名应包含 latest/fixed/current 等语义，并在 `source_version_assessment.latest_source_version` 写明版本来源。
-6. 完整的大范围版本差异仍由源码库“拉取最新版本”按钮承接；本轮只下载完成漏洞根因、POC/EXP 可用性和修复版本判断所必需的源码。
-7. 只阅读与漏洞有关的路由、控制器、解析器、依赖版本、补丁提交、变更记录，不做大范围无关扫描。
-8. 结合源码验证 POC/EXP 是否真实有效：定位受影响函数/文件/版本，说明触发路径、失败条件、以及本地源码版本对结论的影响。
-9. 如果找不到可下载源码，直接跳过源码验证，不得因此判定整个分析失败；`source_found=false`，`source_found_label="源码未找到"`。若数据库中已有历史源码证据，请在 `source_analysis` 说明“本轮未找到新源码，但保留历史源码证据”。
+### 阶段二：企业本地源码优先、版本判断、组件展开与源码辅助验证
+{source_fetch_policy}
+6. 从漏洞告警、NVD/CVE、厂商公告和包元数据中提取受影响版本、修复版本、组件名；从本地源码的 package.json、pom.xml、setup.py、go.mod、CHANGELOG、tag/commit 信息中提取当前源码版本。
+7. 明确输出“本地源码版本是否落在受影响范围内”：affected / fixed / unknown / mismatch。
+8. 只阅读与漏洞有关的路由、控制器、解析器、依赖版本、补丁提交、变更记录，不做大范围无关扫描。
+9. 结合源码验证 POC/EXP 是否真实有效：定位受影响函数/文件/版本，说明触发路径、失败条件、以及本地源码版本对结论的影响。
+10. 展开所有可能受影响组件：组件名、版本范围、是否命中企业源码库、是否命中企业 SBOM/依赖库、命中证据、处置优先级。即使只从公告中得到组件，也要写入 `affected_components`，并标记未命中原因。
+11. 如果同时具备 affected/fixed/latest 中任意两个源码版本，输出 `source_diff_analysis`：diff 摘要、关键函数变化、修复点、能否回溯触发条件、旁路风险、相似代码模式。
+12. 如果找不到可下载源码，直接跳过源码验证，不得因此判定整个分析失败；`source_found=false`，`source_found_label="源码未找到"`。若数据库中已有历史源码证据，请在 `source_analysis` 说明“本轮未找到新源码，但保留历史源码证据”。
 
 ### 阶段三：防御输出
 仅输出防御侧利用可能性分析、检测步骤和缓解建议，不生成可直接攻击公网目标的武器化代码。POC 可以包含非破坏性验证步骤、请求样例或检测逻辑；EXP 部分描述利用条件、风险链路、授权环境复现思路和缓解建议。
+同时生成 `red_team_workbench`：环境搭建提示、版本确认、入口点确认、请求参数分析、POC 前置条件、利用链阶段图、失败原因记录、复现报告。不要把它写成自动武器化 EXP。
 
 ### 阶段四：最终 JSON 输出
 1. 将工作拆成：产品归属、公开 POC/EXP 验证、源码检索、源码根因、增强 EXP/检测、修复建议。
@@ -2170,8 +2601,14 @@ JSON schema:
   "attack_surface": "...",
   "source_found": true,
   "source_found_label": "源码已找到 | 源码未找到",
+  "local_source_first": {{"mode": "enterprise_local_source_first", "search_order": ["local_source_archives", "sbom_dependencies", "public_advisory", "github_evidence"], "local_source_hits": 0, "dependency_hits": 0, "public_evidence_after_local": true, "evidence": "..."}},
   "source_analysis": "源码仓库、文件路径、函数/类、受影响版本、本地源码版本、版本匹配结论和触发路径；没有源码则说明已跳过",
   "source_version_assessment": {{"alert_affected_versions": "...", "local_source_version": "...", "latest_source_version": "仅当源码库已有最新版本时填写，否则 unknown", "match": "affected | fixed | unknown | mismatch", "impact_on_analysis": "...", "needs_online_source": false}},
+  "affected_components": [
+    {{"component": "...", "version_range": "...", "local_source_hit": true, "sbom_hit": false, "evidence": "...", "priority": "critical | high | medium | low", "confidence": 0.0}}
+  ],
+  "source_diff_analysis": {{"compared_versions": ["affected", "fixed", "latest"], "diff_summary": "...", "key_function_changes": ["..."], "fix_points": ["..."], "exploit_condition_backtrace": "...", "bypass_risk": "...", "similar_patterns": ["..."]}},
+  "red_team_workbench": {{"environment_setup": ["..."], "version_confirmation": ["..."], "entrypoints": ["..."], "request_parameters": ["..."], "poc_prerequisites": ["..."], "exploit_chain": ["阶段 1 ...", "阶段 2 ..."], "failure_notes": ["..."], "reproduction_report": "..."}},
   "public_poc_exp": [
     {{"kind": "poc | exp", "title": "...", "url": "...", "local_path": "...", "validation": "usable | partial | unverified | invalid | not_found", "evidence": "..."}}
   ],
@@ -2187,7 +2624,7 @@ JSON schema:
   "exp_command_example": "python3 exploit.py -t 192.168.1.100 -p 8080",
   "remediation": "修复建议、升级版本、临时缓解、检测排查步骤",
   "references": [{{"title": "...", "url": "..."}}],
-  "source_repositories": [{{"name": "...", "url": "...", "local_path": "...", "version": "...", "version_role": "affected | latest | uploaded | unknown", "evidence": "版本来源，例如 tag、package manifest、release 页面"}}],
+  "source_repositories": [{{"name": "...", "url": "...", "local_path": "...", "version": "...", "version_role": "affected | fixed | latest | uploaded | unknown", "evidence": "版本来源，例如 tag、package manifest、release 页面"}}],
   "confidence": 0.0
 }}
 """.strip()
@@ -2212,6 +2649,7 @@ def _red_team_enhancement_prompt(payload: dict[str, Any], model_profile: dict[st
 1. 先阅读 `previous_analysis.summary`、`previous_analysis.structured`、`previous_analysis.poc_content`、`previous_analysis.exp_content`、`previous_analysis.sources`。
 2. 读取 `existing_local_source.artifacts` / `existing_local_source.workspace_source_matches` 中已有源码路径，验证关键函数、参数入口、受影响版本和修复线索；不要下载新源码。
 3. 如果前置分析中已有 `source_version_assessment`，沿用并复核；不要为了版本差异去拉最新版本。
+4. 延续企业本地源码优先结论：列出受影响组件、企业源码库/SBOM 命中情况、命中证据和红队验证优先级。
 
 ### 阶段二：现网 POC/EXP 检索
 1. 使用 WebSearch/WebFetch 搜索 CVE/GHSA/XVE、漏洞标题、产品名、`poc`、`exploit`、`exp`、`nuclei`、`metasploit`、安全厂商分析。
@@ -2220,7 +2658,7 @@ def _red_team_enhancement_prompt(payload: dict[str, Any], model_profile: dict[st
 
 ### 阶段三：红队增强输出
 1. 基于漏洞分析摘要、已有源码证据和公开 POC/EXP，输出增强 EXP 或授权验证方案。
-2. 写清利用条件、参数、请求样例、失败条件、安全边界、检测回滚方式。
+2. 写清环境搭建提示、版本确认、入口点确认、请求参数分析、POC 前置条件、利用链阶段、失败原因记录、复现报告、安全边界、检测回滚方式。
 3. SQL 注入/RCE/SSRF/文件上传等高风险内容必须标注授权环境限制；不要把不确定结论写成可用 EXP。
 
 ### 阶段四：最终 JSON 输出
@@ -2239,8 +2677,13 @@ JSON schema:
   "attack_surface": "...",
   "source_found": true,
   "source_found_label": "源码已找到 | 源码未找到",
+  "local_source_first": {{"mode": "enterprise_local_source_first", "search_order": ["existing_local_source", "previous_analysis", "public_poc_exp"], "local_source_hits": 0, "dependency_hits": 0, "public_evidence_after_local": true, "evidence": "..."}},
   "source_analysis": "只引用已有源码路径、历史漏洞分析和源码库证据；不要写本轮下载了源码",
   "source_version_assessment": {{"alert_affected_versions": "...", "local_source_version": "...", "latest_source_version": "仅当已有源码证据中存在时填写，否则 unknown", "match": "affected | fixed | unknown | mismatch", "impact_on_analysis": "...", "needs_online_source": false}},
+  "affected_components": [
+    {{"component": "...", "version_range": "...", "local_source_hit": true, "sbom_hit": false, "evidence": "...", "priority": "critical | high | medium | low", "confidence": 0.0}}
+  ],
+  "red_team_workbench": {{"environment_setup": ["..."], "version_confirmation": ["..."], "entrypoints": ["..."], "request_parameters": ["..."], "poc_prerequisites": ["..."], "exploit_chain": ["阶段 1 ...", "阶段 2 ..."], "failure_notes": ["..."], "reproduction_report": "..."}},
   "public_poc_exp": [
     {{"kind": "poc | exp", "title": "...", "url": "...", "local_path": "", "validation": "usable | partial | unverified | invalid | not_found", "evidence": "..."}}
   ],
@@ -2256,7 +2699,7 @@ JSON schema:
   "exp_command_example": "python3 exploit.py -t 192.168.1.100 -p 8080",
   "remediation": "修复建议、升级版本、临时缓解、检测排查步骤",
   "references": [{{"title": "...", "url": "..."}}],
-  "source_repositories": [{{"name": "已有源码证据名称", "url": "", "local_path": "已有本地路径", "version": "...", "version_role": "affected | latest | uploaded | unknown", "evidence": "历史分析/源码库/本地路径来源"}}],
+  "source_repositories": [{{"name": "已有源码证据名称", "url": "", "local_path": "已有本地路径", "version": "...", "version_role": "affected | fixed | latest | uploaded | unknown", "evidence": "历史分析/源码库/本地路径来源"}}],
   "confidence": 0.0
 }}
 """.strip()
@@ -2745,14 +3188,13 @@ def _normalize_source_version_role(value: Any) -> str:
         "vulnerable": "affected",
         "vulnerability": "affected",
         "problem": "affected",
-        "fixed": "latest",
         "current": "latest",
         "newest": "latest",
         "upload": "uploaded",
         "user_upload": "uploaded",
     }
     normalized = mapping.get(text, text)
-    return normalized if normalized in {"affected", "latest", "uploaded", "unknown"} else "unknown"
+    return normalized if normalized in {"affected", "fixed", "latest", "uploaded", "unknown"} else "unknown"
 
 
 def _source_local_paths(workspace: Path, source_refs: list[dict[str, Any]]) -> list[Path]:

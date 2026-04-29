@@ -91,6 +91,7 @@ async def create_source_archive_from_stream(
     content_type: str = "application/octet-stream",
     product_hint: str = "",
     source_version: str = "",
+    version_role: str = "uploaded",
 ) -> dict[str, Any]:
     root = _upload_root()
     root.mkdir(parents=True, exist_ok=True)
@@ -119,7 +120,7 @@ async def create_source_archive_from_stream(
         "size_bytes": size,
         "sha256": digest.hexdigest(),
         "source_version": _clean_source_version(source_version),
-        "version_role": "uploaded",
+        "version_role": _clean_version_role(version_role or "uploaded"),
         "status": "queued",
         "minio_status": "pending",
         "local_path": str(path),
@@ -1161,7 +1162,7 @@ JSON schema:
   "suggested_vendor": "厂商或组织，可为空",
   "suggested_aliases": ["别名1", "别名2"],
   "source_version": "源码版本，可为空",
-  "version_role": "uploaded | affected | latest | unknown",
+  "version_role": "uploaded | affected | fixed | latest | unknown",
   "architecture_summary": "中文说明源码目录结构、技术栈、入口、核心模块",
   "function_summary": "中文说明该源码实现的业务/组件能力",
   "product_evidence": "从包名、README、命名空间、组织名、文件结构中得到的产品归属证据",
@@ -1534,14 +1535,13 @@ def _clean_version_role(value: Any) -> str:
         "vulnerable": "affected",
         "vulnerability": "affected",
         "problem": "affected",
-        "fixed": "latest",
         "current": "latest",
         "newest": "latest",
         "upload": "uploaded",
         "user_upload": "uploaded",
     }
     normalized = mapping.get(text, text)
-    return normalized if normalized in {"uploaded", "affected", "latest", "unknown"} else "unknown"
+    return normalized if normalized in {"uploaded", "affected", "fixed", "latest", "unknown"} else "unknown"
 
 
 def _clean_aliases(values: Any) -> list[str]:

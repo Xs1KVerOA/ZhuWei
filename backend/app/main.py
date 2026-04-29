@@ -71,6 +71,7 @@ from .source_archive import (
     schedule_source_archive_processing,
     start_source_archive_workers,
 )
+from .source_diff import analyze_source_diff
 from .update_manager import (
     create_update_from_stream,
     get_update,
@@ -82,7 +83,7 @@ from .update_manager import (
 
 
 logger = logging.getLogger("zhuwei")
-FRONTEND_BUILD_VERSION = "20260428-analysis-source"
+FRONTEND_BUILD_VERSION = "20260429-agent-evidence"
 app = FastAPI(title="烛微 ZhuWei")
 
 
@@ -407,6 +408,7 @@ async def upload_source_archive(request: Request, _: None = Depends(require_auth
     filename = unquote(request.headers.get("x-source-filename") or "source.zip")
     product_hint = unquote(request.headers.get("x-source-product") or "")
     source_version = unquote(request.headers.get("x-source-version") or "")
+    version_role = unquote(request.headers.get("x-source-version-role") or "uploaded")
     content_type = request.headers.get("content-type") or "application/octet-stream"
     try:
         archive = await create_source_archive_from_stream(
@@ -415,6 +417,7 @@ async def upload_source_archive(request: Request, _: None = Depends(require_auth
             content_type=content_type,
             product_hint=product_hint,
             source_version=source_version,
+            version_role=version_role,
         )
     except ValueError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
@@ -906,6 +909,64 @@ async def get_vulnerability_analysis_events(
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     return await run_blocking(db.list_analysis_events, vulnerability_id, run_id=run_id, limit=limit, offset=offset)
+
+
+@app.get("/api/vulnerabilities/{vulnerability_id}/component-impacts")
+async def get_vulnerability_component_impacts(vulnerability_id: int, _: None = Depends(require_auth)):
+    if not await run_blocking(db.get_vulnerability, vulnerability_id):
+        raise HTTPException(status_code=404, detail="vulnerability not found")
+    return {"data": await run_blocking(db.list_vulnerability_component_impacts, vulnerability_id, limit=100)}
+
+
+@app.post("/api/vulnerabilities/{vulnerability_id}/component-impacts/refresh")
+async def refresh_vulnerability_component_impacts(vulnerability_id: int, _: None = Depends(require_auth)):
+    if not await run_blocking(db.get_vulnerability, vulnerability_id):
+        raise HTTPException(status_code=404, detail="vulnerability not found")
+    return {"data": await run_blocking(db.refresh_vulnerability_component_impacts, vulnerability_id)}
+
+
+@app.get("/api/vulnerabilities/{vulnerability_id}/redteam-workbench")
+async def get_vulnerability_redteam_workbench(vulnerability_id: int, _: None = Depends(require_auth)):
+    if not await run_blocking(db.get_vulnerability, vulnerability_id):
+        raise HTTPException(status_code=404, detail="vulnerability not found")
+    return {"data": await run_blocking(db.get_redteam_workbench, vulnerability_id)}
+
+
+@app.post("/api/source-diff/analyze")
+async def analyze_source_diff_endpoint(payload: dict, _: None = Depends(require_auth)):
+    try:
+        return {"status": "ok", "data": await run_blocking(analyze_source_diff, payload)}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/source-diff")
+async def list_source_diff_endpoint(
+    vulnerability_id: int = 0,
+    product_key: str = "",
+    q: str = "",
+    limit: int = 30,
+    offset: int = 0,
+    _: None = Depends(require_auth),
+):
+    return await run_blocking(
+        db.list_source_diff_analyses,
+        vulnerability_id=vulnerability_id,
+        product_key_value=product_key,
+        query=q,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/api/source-diff/{analysis_id}")
+async def get_source_diff_endpoint(analysis_id: int, _: None = Depends(require_auth)):
+    item = await run_blocking(db.get_source_diff_analysis, analysis_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="source diff analysis not found")
+    return item
 
 
 @app.get("/api/vulnerabilities/{vulnerability_id}/analysis/source")

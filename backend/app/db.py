@@ -36,7 +36,9 @@ POSTGRES_ID_TABLES = {
     "sbom_components",
     "sbom_projects",
     "source_archives",
+    "source_diff_analyses",
     "vendor_aliases",
+    "vulnerability_component_impacts",
     "vulnerabilities",
 }
 VULNERABILITY_COLUMNS = [
@@ -749,6 +751,81 @@ def init_db() -> None:
                 ON source_archives(sha256);
             CREATE INDEX IF NOT EXISTS idx_source_archives_created
                 ON source_archives(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS vulnerability_component_impacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vulnerability_id INTEGER NOT NULL,
+                component_name TEXT NOT NULL DEFAULT '',
+                product_key TEXT NOT NULL DEFAULT '',
+                version_range TEXT NOT NULL DEFAULT '',
+                match_status TEXT NOT NULL DEFAULT 'unknown',
+                match_source TEXT NOT NULL DEFAULT '',
+                source_archive_id INTEGER NOT NULL DEFAULT 0,
+                sbom_project_id INTEGER NOT NULL DEFAULT 0,
+                sbom_component_id INTEGER NOT NULL DEFAULT 0,
+                evidence TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT 'medium',
+                confidence REAL NOT NULL DEFAULT 0,
+                raw TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(
+                    vulnerability_id, component_name, product_key, match_source,
+                    source_archive_id, sbom_component_id
+                ),
+                FOREIGN KEY(vulnerability_id) REFERENCES vulnerabilities(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_component_impacts_vulnerability
+                ON vulnerability_component_impacts(vulnerability_id, priority, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_component_impacts_product
+                ON vulnerability_component_impacts(product_key, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS redteam_workbench (
+                vulnerability_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'ready',
+                environment_setup TEXT NOT NULL DEFAULT '[]',
+                version_confirmation TEXT NOT NULL DEFAULT '[]',
+                entrypoints TEXT NOT NULL DEFAULT '[]',
+                request_parameters TEXT NOT NULL DEFAULT '[]',
+                poc_prerequisites TEXT NOT NULL DEFAULT '[]',
+                exploit_chain TEXT NOT NULL DEFAULT '[]',
+                failure_notes TEXT NOT NULL DEFAULT '[]',
+                reproduction_report TEXT NOT NULL DEFAULT '',
+                raw TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(vulnerability_id) REFERENCES vulnerabilities(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS source_diff_analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vulnerability_id INTEGER NOT NULL DEFAULT 0,
+                product_key TEXT NOT NULL DEFAULT '',
+                product_name TEXT NOT NULL DEFAULT '',
+                affected_archive_id INTEGER NOT NULL DEFAULT 0,
+                fixed_archive_id INTEGER NOT NULL DEFAULT 0,
+                latest_archive_id INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'finished',
+                summary TEXT NOT NULL DEFAULT '',
+                key_function_changes TEXT NOT NULL DEFAULT '[]',
+                fix_points TEXT NOT NULL DEFAULT '[]',
+                exploit_condition_backtrace TEXT NOT NULL DEFAULT '',
+                bypass_risk TEXT NOT NULL DEFAULT '',
+                similar_patterns TEXT NOT NULL DEFAULT '[]',
+                evidence TEXT NOT NULL DEFAULT '[]',
+                agent_model TEXT NOT NULL DEFAULT '',
+                raw TEXT NOT NULL DEFAULT '{}',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                analyzed_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_source_diff_vulnerability
+                ON source_diff_analyses(vulnerability_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_source_diff_product
+                ON source_diff_analyses(product_key, updated_at DESC);
 
             CREATE TABLE IF NOT EXISTS github_evidence (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4223,6 +4300,17 @@ def _deserialize_vuln(row: dict[str, Any]) -> dict[str, Any]:
     row["analysis_confidence"] = _analysis_confidence(row["analysis_raw"])
     row["source_credibility"] = _source_credibility(row["analysis_sources"])
     row["analysis_feedback"] = get_analysis_feedback(int(row["id"])) if row.get("id") else None
+    row["component_impacts"] = (
+        list_vulnerability_component_impacts(int(row["id"]), limit=30)
+        if row.get("id")
+        else []
+    )
+    row["redteam_workbench"] = get_redteam_workbench(int(row["id"])) if row.get("id") else None
+    row["latest_source_diff_analysis"] = (
+        latest_source_diff_analysis_for_vulnerability(int(row["id"]))
+        if row.get("id")
+        else None
+    )
     row["analysis_priority"] = int(row.get("analysis_priority") or 50)
     row["analysis_cancel_requested"] = bool(row.get("analysis_cancel_requested"))
     row["analysis_failure_reason"] = row.get("analysis_failure_reason") or ""
@@ -4942,6 +5030,681 @@ def list_source_archives(
     }
 
 
+def refresh_vulnerability_component_impacts(
+    vulnerability_id: int,
+    parsed: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    impacts = derive_vulnerability_component_impacts(vulnerability_id, parsed=parsed)
+    return replace_vulnerability_component_impacts(vulnerability_id, impacts)
+
+
+def replace_vulnerability_component_impacts(
+    vulnerability_id: int,
+    impacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    now = utc_now()
+    seen: set[tuple[Any, ...]] = set()
+    cleaned: list[dict[str, Any]] = []
+    for item in impacts or []:
+        if not isinstance(item, dict):
+            continue
+        marker = (
+            str(item.get("component_name") or "").strip().lower(),
+            str(item.get("product_key") or "").strip().lower(),
+            str(item.get("match_source") or "").strip().lower(),
+            int(item.get("source_archive_id") or 0),
+            int(item.get("sbom_component_id") or 0),
+        )
+        if marker in seen:
+            continue
+        seen.add(marker)
+        cleaned.append(item)
+        if len(cleaned) >= 200:
+            break
+    with connection() as conn:
+        conn.execute(
+            "DELETE FROM vulnerability_component_impacts WHERE vulnerability_id=?",
+            (vulnerability_id,),
+        )
+        for item in cleaned:
+            raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+            conn.execute(
+                """
+                INSERT INTO vulnerability_component_impacts (
+                    vulnerability_id, component_name, product_key, version_range,
+                    match_status, match_source, source_archive_id, sbom_project_id,
+                    sbom_component_id, evidence, priority, confidence, raw,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    vulnerability_id,
+                    _clip_text(item.get("component_name") or "", 240),
+                    _clip_text(item.get("product_key") or "", 180),
+                    _clip_text(item.get("version_range") or "", 300),
+                    _clip_text(item.get("match_status") or "unknown", 80),
+                    _clip_text(item.get("match_source") or "", 80),
+                    int(item.get("source_archive_id") or 0),
+                    int(item.get("sbom_project_id") or 0),
+                    int(item.get("sbom_component_id") or 0),
+                    _clip_text(item.get("evidence") or "", 3000),
+                    _clip_text(item.get("priority") or "medium", 32),
+                    float(item.get("confidence") or 0),
+                    json.dumps(raw, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+    return list_vulnerability_component_impacts(vulnerability_id)
+
+
+def derive_vulnerability_component_impacts(
+    vulnerability_id: int,
+    parsed: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM vulnerabilities WHERE id=?",
+            (vulnerability_id,),
+        ).fetchone()
+        if row is None:
+            return []
+        vuln = dict(row)
+        analysis_raw = _json_value(vuln.get("analysis_raw"), {})
+        if parsed is None and isinstance(analysis_raw, dict):
+            parsed = analysis_raw.get("claude_output") if isinstance(analysis_raw.get("claude_output"), dict) else {}
+        parsed = parsed if isinstance(parsed, dict) else {}
+        labels = _component_lookup_labels(vuln, parsed)
+        product_keys = _component_product_keys(conn, vulnerability_id, labels)
+        impacts: list[dict[str, Any]] = []
+        impacts.extend(_agent_component_impacts(parsed, product_keys))
+        impacts.extend(_source_archive_component_impacts(conn, product_keys, labels))
+        impacts.extend(_sbom_component_impacts(conn, product_keys, labels))
+    if not impacts and labels:
+        impacts.append(
+            {
+                "component_name": labels[0],
+                "product_key": product_key(labels[0]),
+                "version_range": "",
+                "match_status": "not_matched",
+                "match_source": "local_source_first",
+                "evidence": "已按本地源码优先模式检索，但未在源码库、企业 SBOM 或依赖库中命中。",
+                "priority": "medium",
+                "confidence": 0.2,
+                "raw": {"labels": labels},
+            }
+        )
+    impacts.sort(
+        key=lambda item: (
+            _impact_priority_rank(item.get("priority")),
+            -float(item.get("confidence") or 0),
+            str(item.get("component_name") or ""),
+        )
+    )
+    return impacts[:200]
+
+
+def list_vulnerability_component_impacts(
+    vulnerability_id: int,
+    *,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit or 100), 200))
+    with connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM vulnerability_component_impacts
+            WHERE vulnerability_id=?
+            ORDER BY
+                CASE priority
+                    WHEN 'critical' THEN 0
+                    WHEN 'high' THEN 1
+                    WHEN 'medium' THEN 2
+                    WHEN 'low' THEN 3
+                    ELSE 4
+                END,
+                confidence DESC,
+                updated_at DESC,
+                id DESC
+            LIMIT ?
+            """,
+            (vulnerability_id, limit),
+        ).fetchall()
+    return [_deserialize_component_impact(dict(row)) for row in rows]
+
+
+def _deserialize_component_impact(row: dict[str, Any]) -> dict[str, Any]:
+    row["source_archive_id"] = int(row.get("source_archive_id") or 0)
+    row["sbom_project_id"] = int(row.get("sbom_project_id") or 0)
+    row["sbom_component_id"] = int(row.get("sbom_component_id") or 0)
+    row["confidence"] = float(row.get("confidence") or 0)
+    row["raw"] = _json_value(row.get("raw"), {})
+    return row
+
+
+def upsert_redteam_workbench(
+    vulnerability_id: int,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = _normalize_redteam_workbench_payload(payload)
+    now = utc_now()
+    with connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO redteam_workbench (
+                vulnerability_id, status, environment_setup, version_confirmation,
+                entrypoints, request_parameters, poc_prerequisites, exploit_chain,
+                failure_notes, reproduction_report, raw, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(vulnerability_id) DO UPDATE SET
+                status=excluded.status,
+                environment_setup=excluded.environment_setup,
+                version_confirmation=excluded.version_confirmation,
+                entrypoints=excluded.entrypoints,
+                request_parameters=excluded.request_parameters,
+                poc_prerequisites=excluded.poc_prerequisites,
+                exploit_chain=excluded.exploit_chain,
+                failure_notes=excluded.failure_notes,
+                reproduction_report=excluded.reproduction_report,
+                raw=excluded.raw,
+                updated_at=excluded.updated_at
+            """,
+            (
+                vulnerability_id,
+                normalized["status"],
+                json.dumps(normalized["environment_setup"], ensure_ascii=False),
+                json.dumps(normalized["version_confirmation"], ensure_ascii=False),
+                json.dumps(normalized["entrypoints"], ensure_ascii=False),
+                json.dumps(normalized["request_parameters"], ensure_ascii=False),
+                json.dumps(normalized["poc_prerequisites"], ensure_ascii=False),
+                json.dumps(normalized["exploit_chain"], ensure_ascii=False),
+                json.dumps(normalized["failure_notes"], ensure_ascii=False),
+                normalized["reproduction_report"],
+                json.dumps(normalized["raw"], ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+    return get_redteam_workbench(vulnerability_id) or {}
+
+
+def get_redteam_workbench(vulnerability_id: int) -> dict[str, Any] | None:
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM redteam_workbench WHERE vulnerability_id=?",
+            (vulnerability_id,),
+        ).fetchone()
+    return None if row is None else _deserialize_redteam_workbench(dict(row))
+
+
+def _deserialize_redteam_workbench(row: dict[str, Any]) -> dict[str, Any]:
+    for key in [
+        "environment_setup",
+        "version_confirmation",
+        "entrypoints",
+        "request_parameters",
+        "poc_prerequisites",
+        "exploit_chain",
+        "failure_notes",
+    ]:
+        row[key] = _json_value(row.get(key), [])
+    row["raw"] = _json_value(row.get("raw"), {})
+    return row
+
+
+def create_source_diff_analysis(payload: dict[str, Any]) -> dict[str, Any]:
+    now = utc_now()
+    with connection() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO source_diff_analyses (
+                vulnerability_id, product_key, product_name,
+                affected_archive_id, fixed_archive_id, latest_archive_id,
+                status, summary, key_function_changes, fix_points,
+                exploit_condition_backtrace, bypass_risk, similar_patterns,
+                evidence, agent_model, raw, error, created_at, updated_at, analyzed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(payload.get("vulnerability_id") or 0),
+                _clip_text(payload.get("product_key") or "", 180),
+                _clip_text(payload.get("product_name") or "", 240),
+                int(payload.get("affected_archive_id") or 0),
+                int(payload.get("fixed_archive_id") or 0),
+                int(payload.get("latest_archive_id") or 0),
+                _clip_text(payload.get("status") or "finished", 40),
+                _clip_text(payload.get("summary") or "", 12000),
+                json.dumps(_json_list_value(payload.get("key_function_changes")), ensure_ascii=False),
+                json.dumps(_json_list_value(payload.get("fix_points")), ensure_ascii=False),
+                _clip_text(payload.get("exploit_condition_backtrace") or "", 12000),
+                _clip_text(payload.get("bypass_risk") or "", 12000),
+                json.dumps(_json_list_value(payload.get("similar_patterns")), ensure_ascii=False),
+                json.dumps(_json_list_value(payload.get("evidence")), ensure_ascii=False),
+                _clip_text(payload.get("agent_model") or "", 120),
+                json.dumps(payload.get("raw") if isinstance(payload.get("raw"), dict) else {}, ensure_ascii=False),
+                _clip_text(payload.get("error") or "", 3000),
+                payload.get("created_at") or now,
+                now,
+                payload.get("analyzed_at") or now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM source_diff_analyses WHERE id=?",
+            (cursor.lastrowid,),
+        ).fetchone()
+    return _deserialize_source_diff_analysis(dict(row)) if row else {}
+
+
+def get_source_diff_analysis(analysis_id: int) -> dict[str, Any] | None:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM source_diff_analyses WHERE id=?", (analysis_id,)).fetchone()
+    return None if row is None else _deserialize_source_diff_analysis(dict(row))
+
+
+def latest_source_diff_analysis_for_vulnerability(vulnerability_id: int) -> dict[str, Any] | None:
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM source_diff_analyses
+            WHERE vulnerability_id=?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (vulnerability_id,),
+        ).fetchone()
+    return None if row is None else _deserialize_source_diff_analysis(dict(row))
+
+
+def list_source_diff_analyses(
+    *,
+    vulnerability_id: int = 0,
+    product_key_value: str = "",
+    query: str = "",
+    limit: int = 30,
+    offset: int = 0,
+) -> dict[str, Any]:
+    limit = max(1, min(int(limit or 30), 100))
+    offset = max(0, int(offset or 0))
+    clauses: list[str] = []
+    args: list[Any] = []
+    if vulnerability_id:
+        clauses.append("vulnerability_id=?")
+        args.append(vulnerability_id)
+    if product_key_value:
+        clauses.append("product_key=?")
+        args.append(product_key_value)
+    if query:
+        clauses.append(_ci_like_clause(["product_name", "product_key", "summary", "evidence"]))
+        args.extend([_ci_like(query)] * 4)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with connection() as conn:
+        total = int(conn.execute(f"SELECT COUNT(*) AS total FROM source_diff_analyses {where}", args).fetchone()["total"])
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM source_diff_analyses
+            {where}
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            [*args, limit, offset],
+        ).fetchall()
+    return {"total": total, "data": [_deserialize_source_diff_analysis(dict(row)) for row in rows]}
+
+
+def _deserialize_source_diff_analysis(row: dict[str, Any]) -> dict[str, Any]:
+    for key in ["key_function_changes", "fix_points", "similar_patterns", "evidence"]:
+        row[key] = _json_value(row.get(key), [])
+    row["raw"] = _json_value(row.get("raw"), {})
+    for key in ["vulnerability_id", "affected_archive_id", "fixed_archive_id", "latest_archive_id"]:
+        row[key] = int(row.get(key) or 0)
+    return row
+
+
+def _component_lookup_labels(vuln: dict[str, Any], parsed: dict[str, Any]) -> list[str]:
+    labels: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        lowered = text.lower()
+        if lowered in {"unknown", "n/a", "none", "security", "vulnerability"}:
+            return
+        labels.append(text[:240])
+
+    add(vuln.get("product"))
+    raw = _json_value(vuln.get("raw"), {})
+    if isinstance(raw, dict):
+        for key in ["product", "package", "project", "repo", "repository", "component"]:
+            add(raw.get(key))
+    attribution = parsed.get("product_attribution") if isinstance(parsed.get("product_attribution"), dict) else {}
+    add(attribution.get("product"))
+    for key in ["affected_products", "components"]:
+        items = parsed.get(key)
+        if isinstance(items, list):
+            for item in items[:30]:
+                if isinstance(item, dict):
+                    add(item.get("component") or item.get("name") or item.get("product"))
+                else:
+                    add(item)
+    for item in _agent_component_impacts(parsed, []):
+        add(item.get("component_name"))
+    title = str(vuln.get("title") or "")
+    for token in re.findall(r"\b[A-Za-z][A-Za-z0-9_.@+/-]{2,}\b", title):
+        if token.lower() in {"cve", "cvss", "poc", "exp", "rce", "sql", "xss", "ssrf", "csrf"}:
+            continue
+        if re.match(r"(?i)^cve-\d{4}-\d{4,}$", token):
+            continue
+        add(token)
+    result: list[str] = []
+    seen: set[str] = set()
+    for label in labels:
+        key = _component_norm(label)
+        if key and key not in seen:
+            seen.add(key)
+            result.append(label)
+    return result[:30]
+
+
+def _component_product_keys(
+    conn: sqlite3.Connection,
+    vulnerability_id: int,
+    labels: list[str],
+) -> list[str]:
+    keys: list[str] = []
+    rows = conn.execute(
+        "SELECT product_key, product_name FROM product_vulnerabilities WHERE vulnerability_id=?",
+        (vulnerability_id,),
+    ).fetchall()
+    for row in rows:
+        keys.append(str(row["product_key"] or "").strip())
+        if row["product_name"]:
+            keys.append(product_key(str(row["product_name"])))
+    for label in labels:
+        keys.append(product_key(label))
+    result: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        if key and key not in seen:
+            seen.add(key)
+            result.append(key)
+    return result[:40]
+
+
+def _agent_component_impacts(parsed: dict[str, Any], product_keys: list[str]) -> list[dict[str, Any]]:
+    raw_items = parsed.get("affected_components") or parsed.get("impact_components") or []
+    if not isinstance(raw_items, list):
+        raw_items = []
+    impacts: list[dict[str, Any]] = []
+    for item in raw_items[:80]:
+        if isinstance(item, str):
+            component_name = item.strip()
+            raw = {"component": component_name}
+        elif isinstance(item, dict):
+            component_name = str(item.get("component") or item.get("component_name") or item.get("name") or item.get("product") or "").strip()
+            raw = item
+        else:
+            continue
+        if not component_name:
+            continue
+        version_range = ""
+        if isinstance(item, dict):
+            version_range = str(
+                item.get("version_range")
+                or item.get("affected_versions")
+                or item.get("versions")
+                or ""
+            ).strip()
+        pk = product_key(component_name)
+        impacts.append(
+            {
+                "component_name": component_name,
+                "product_key": pk if pk in product_keys or not product_keys else pk,
+                "version_range": version_range,
+                "match_status": str(raw.get("match_status") or raw.get("status") or "agent_identified")[:80],
+                "match_source": "agent",
+                "evidence": str(raw.get("evidence") or raw.get("reason") or "AI Agent 从漏洞情报与源码分析中展开的受影响组件。")[:3000],
+                "priority": _impact_priority(raw.get("priority"), raw.get("local_source_hit"), raw.get("sbom_hit")),
+                "confidence": _safe_float(raw.get("confidence"), 0.55),
+                "raw": raw,
+            }
+        )
+    return impacts
+
+
+def _source_archive_component_impacts(
+    conn: sqlite3.Connection,
+    product_keys: list[str],
+    labels: list[str],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for key in product_keys[:40]:
+        if not key:
+            continue
+        for row in conn.execute(
+            """
+            SELECT *
+            FROM source_archives
+            WHERE product_key=?
+              AND status NOT IN ('failed', 'canceled')
+            ORDER BY product_confirmed DESC, updated_at DESC
+            LIMIT 30
+            """,
+            (key,),
+        ).fetchall():
+            archive_id = int(row["id"] or 0)
+            if archive_id and archive_id not in seen_ids:
+                seen_ids.add(archive_id)
+                rows.append(dict(row))
+    for label in labels[:20]:
+        like = _ci_like(label)
+        for row in conn.execute(
+            """
+            SELECT *
+            FROM source_archives
+            WHERE status NOT IN ('failed', 'canceled')
+              AND (
+                  LOWER(COALESCE(product_name, '')) LIKE ?
+                  OR LOWER(COALESCE(suggested_product_name, '')) LIKE ?
+                  OR LOWER(COALESCE(product_hint, '')) LIKE ?
+                  OR LOWER(COALESCE(filename, '')) LIKE ?
+              )
+            ORDER BY product_confirmed DESC, updated_at DESC
+            LIMIT 20
+            """,
+            (like, like, like, like),
+        ).fetchall():
+            archive_id = int(row["id"] or 0)
+            if archive_id and archive_id not in seen_ids:
+                seen_ids.add(archive_id)
+                rows.append(dict(row))
+    impacts: list[dict[str, Any]] = []
+    for row in rows[:80]:
+        archive = _deserialize_source_archive(row)
+        component_name = str(
+            archive.get("product_name")
+            or archive.get("suggested_product_name")
+            or archive.get("product_hint")
+            or archive.get("filename")
+            or "源码库组件"
+        ).strip()
+        role = str(archive.get("version_role") or "unknown")
+        version = str(archive.get("source_version") or "").strip()
+        impacts.append(
+            {
+                "component_name": component_name,
+                "product_key": str(archive.get("product_key") or product_key(component_name)),
+                "version_range": f"{role} {version}".strip(),
+                "match_status": "local_source_matched",
+                "match_source": "local_source",
+                "source_archive_id": int(archive.get("id") or 0),
+                "evidence": str(archive.get("product_evidence") or archive.get("architecture_summary") or "企业本地源码库命中该产品/组件源码。")[:3000],
+                "priority": "high" if role in {"affected", "uploaded"} else "medium",
+                "confidence": 0.9 if archive.get("product_confirmed") else 0.7,
+                "raw": {
+                    "source_version": version,
+                    "version_role": role,
+                    "status": archive.get("status"),
+                    "origin": archive.get("origin"),
+                    "filename": archive.get("filename"),
+                },
+            }
+        )
+    return impacts
+
+
+def _sbom_component_impacts(
+    conn: sqlite3.Connection,
+    product_keys: list[str],
+    labels: list[str],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for key in product_keys[:40]:
+        if not key:
+            continue
+        for row in conn.execute(
+            """
+            SELECT c.*, p.name AS project_name
+            FROM sbom_components c
+            JOIN sbom_projects p ON p.id = c.project_id
+            WHERE c.product_key=?
+            ORDER BY c.confidence DESC, c.updated_at DESC
+            LIMIT 30
+            """,
+            (key,),
+        ).fetchall():
+            component_id = int(row["id"] or 0)
+            if component_id and component_id not in seen_ids:
+                seen_ids.add(component_id)
+                rows.append(dict(row))
+    for label in labels[:20]:
+        like = _ci_like(label)
+        for row in conn.execute(
+            """
+            SELECT c.*, p.name AS project_name
+            FROM sbom_components c
+            JOIN sbom_projects p ON p.id = c.project_id
+            WHERE LOWER(COALESCE(c.name, '')) LIKE ?
+               OR LOWER(COALESCE(c.purl, '')) LIKE ?
+            ORDER BY c.confidence DESC, c.updated_at DESC
+            LIMIT 20
+            """,
+            (like, like),
+        ).fetchall():
+            component_id = int(row["id"] or 0)
+            if component_id and component_id not in seen_ids:
+                seen_ids.add(component_id)
+                rows.append(dict(row))
+    impacts: list[dict[str, Any]] = []
+    for row in rows[:80]:
+        component = _deserialize_sbom_component(row)
+        component_name = str(component.get("name") or component.get("purl") or "依赖组件").strip()
+        version = str(component.get("version") or "").strip()
+        project_name = str(component.get("project_name") or "").strip()
+        impacts.append(
+            {
+                "component_name": component_name,
+                "product_key": str(component.get("product_key") or product_key(component_name)),
+                "version_range": version,
+                "match_status": "dependency_matched",
+                "match_source": "sbom",
+                "sbom_project_id": int(component.get("project_id") or 0),
+                "sbom_component_id": int(component.get("id") or 0),
+                "evidence": f"企业 SBOM/依赖库命中：{project_name or '-'} / {component_name} {version or ''} {component.get('purl') or ''}".strip(),
+                "priority": "high",
+                "confidence": max(float(component.get("confidence") or 0), 0.72),
+                "raw": {
+                    "project_name": project_name,
+                    "purl": component.get("purl"),
+                    "supplier": component.get("supplier"),
+                    "match_method": component.get("match_method"),
+                },
+            }
+        )
+    return impacts
+
+
+def _normalize_redteam_workbench_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+
+    def pick(*keys: str) -> Any:
+        for key in keys:
+            if payload.get(key) not in (None, "", [], {}):
+                return payload.get(key)
+        return []
+
+    reproduction = pick("reproduction_report", "report", "validation_report")
+    if isinstance(reproduction, (dict, list)):
+        reproduction_text = json.dumps(reproduction, ensure_ascii=False, indent=2)
+    else:
+        reproduction_text = str(reproduction or "").strip()
+    return {
+        "status": _clip_text(payload.get("status") or "ready", 40),
+        "environment_setup": _json_list_value(pick("environment_setup", "environment", "lab_setup")),
+        "version_confirmation": _json_list_value(pick("version_confirmation", "version_check", "version_checks")),
+        "entrypoints": _json_list_value(pick("entrypoints", "entry_points", "entrypoint_confirmation")),
+        "request_parameters": _json_list_value(pick("request_parameters", "parameters", "request_analysis")),
+        "poc_prerequisites": _json_list_value(pick("poc_prerequisites", "prerequisites", "preconditions")),
+        "exploit_chain": _json_list_value(pick("exploit_chain", "chain", "stages", "exploit_chain_stages")),
+        "failure_notes": _json_list_value(pick("failure_notes", "failure_reasons", "failure_record")),
+        "reproduction_report": reproduction_text[:12000],
+        "raw": payload,
+    }
+
+
+def _json_list_value(value: Any) -> list[Any]:
+    if value in (None, "", {}, []):
+        return []
+    if isinstance(value, list):
+        return value[:100]
+    if isinstance(value, tuple):
+        return list(value)[:100]
+    if isinstance(value, dict):
+        return [value]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    lines = [line.strip(" \t-•") for line in text.splitlines() if line.strip()]
+    return lines[:100] if len(lines) > 1 else [text[:4000]]
+
+
+def _component_norm(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"cve-\d{4}-\d{4,}", " ", text, flags=re.I)
+    text = re.sub(r"\b(?:critical|high|medium|low|vulnerability|security|advisory|poc|exp)\b", " ", text, flags=re.I)
+    for token in ["漏洞", "安全", "存在", "高危", "严重", "组件"]:
+        text = text.replace(token, " ")
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", text)[:180]
+
+
+def _impact_priority(value: Any, local_source_hit: Any = None, sbom_hit: Any = None) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"critical", "high", "medium", "low"}:
+        return text
+    if local_source_hit or sbom_hit:
+        return "high"
+    return "medium"
+
+
+def _impact_priority_rank(value: Any) -> int:
+    return {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(str(value or "").lower(), 4)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def confirm_source_archive_product(
     archive_id: int,
     *,
@@ -5628,6 +6391,9 @@ def delete_vulnerability_analysis(vulnerability_id: int) -> dict[str, Any] | Non
         if row is None:
             return None
         conn.execute("DELETE FROM analysis_events WHERE vulnerability_id=?", (vulnerability_id,))
+        conn.execute("DELETE FROM vulnerability_component_impacts WHERE vulnerability_id=?", (vulnerability_id,))
+        conn.execute("DELETE FROM redteam_workbench WHERE vulnerability_id=?", (vulnerability_id,))
+        conn.execute("DELETE FROM source_diff_analyses WHERE vulnerability_id=?", (vulnerability_id,))
         conn.execute(
             """
             UPDATE vulnerabilities
@@ -6100,6 +6866,19 @@ def _analysis_failure_reason(error: str) -> str:
             "402",
             "403",
             "429",
+            "模型源",
+            "unable to connect to api",
+            "connection refused",
+            "connectionrefused",
+            "econnrefused",
+            "connection reset",
+            "network error",
+            "socket hang up",
+            "remote disconnected",
+            "temporary failure",
+            "enotfound",
+            "eai_again",
+            "etimedout",
         ]
     ):
         return "模型源异常"

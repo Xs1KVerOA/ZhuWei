@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>烛微 ZhuWei</title>
     <link rel="icon" href="/brand/logo-mark.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/assets/styles.css?v=20260428-analysis-source" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260429-agent-evidence" />
   </head>
   <body>
     <header class="topbar">
@@ -150,6 +150,7 @@
             <select id="sourceArchiveVersionRole" title="源码版本类型">
               <option value="">全部版本</option>
               <option value="affected">受影响版本</option>
+              <option value="fixed">修复版本</option>
               <option value="latest">最新版本</option>
               <option value="uploaded">手动上传</option>
               <option value="unknown">未知版本</option>
@@ -164,6 +165,13 @@
             <span id="sourceArchiveFileName" class="source-file-name">未选择文件</span>
           </label>
           <input id="sourceArchiveProduct" type="text" placeholder="产品提示，可留空" />
+          <select id="sourceArchiveRole" title="源码版本角色">
+            <option value="uploaded">手动上传</option>
+            <option value="affected">受影响版本</option>
+            <option value="fixed">修复版本</option>
+            <option value="latest">最新版本</option>
+            <option value="unknown">未知版本</option>
+          </select>
           <input id="sourceArchiveVersion" type="text" placeholder="源码版本，可留空" />
           <button id="sourceArchiveFetchLatest" type="button">拉取最新版本</button>
           <button id="sourceArchiveUpload" type="submit" class="primary">上传源码</button>
@@ -407,6 +415,6 @@
       </section>
     </div>
 
-    <script src="/assets/app.js?v=20260428-analysis-source"></script>
+    <script src="/assets/app.js?v=20260429-agent-evidence"></script>
   </body>
 </html>

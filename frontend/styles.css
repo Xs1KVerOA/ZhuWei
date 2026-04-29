@@ -1310,13 +1310,14 @@ a.intel-button:hover {
 
 .source-upload-form {
   display: grid;
-  grid-template-columns: minmax(220px, 1.2fr) minmax(150px, 0.75fr) minmax(130px, 0.6fr) 128px 112px;
+  grid-template-columns: minmax(220px, 1.2fr) minmax(150px, 0.75fr) 118px minmax(130px, 0.6fr) 128px 112px;
   gap: 10px;
   padding: 0 16px 14px;
   border-bottom: 1px solid var(--line);
 }
 
-.source-upload-form input:not(.source-file-input) {
+.source-upload-form input:not(.source-file-input),
+.source-upload-form select {
   min-height: 36px;
   min-width: 0;
 }
@@ -2336,6 +2337,33 @@ a.analysis-source-pill:hover {
   border-radius: 6px;
   background: #fbfcff;
   padding: 10px;
+}
+
+.analysis-tabs section h4 {
+  margin: 0 0 8px;
+  color: #182235;
+  font-size: 14px;
+}
+
+.analysis-evidence-block {
+  margin-top: 12px;
+}
+
+.analysis-evidence-block h4 {
+  margin: 0 0 8px;
+  color: #182235;
+  font-size: 14px;
+}
+
+.analysis-note {
+  margin: 10px 0 0;
+  color: #344054;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.compact-list li {
+  gap: 4px;
 }
 
 .analysis-panel-tools {

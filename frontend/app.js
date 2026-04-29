@@ -32,7 +32,7 @@ const state = {
 const OVERVIEW_LIMIT = 10;
 const LIST_LIMIT = 30;
 const ALERT_PAGE_LIMIT = 10;
-const FRONTEND_BUILD_VERSION = "20260428-analysis-source";
+const FRONTEND_BUILD_VERSION = "20260429-agent-evidence";
 const intelDetails = new Map();
 let analysisRefreshTimer = null;
 
@@ -2246,6 +2246,7 @@ function sourceVersionLabel(item) {
   const roleLabels = {
     uploaded: "上传版本",
     affected: "受影响版本",
+    fixed: "修复版本",
     latest: "最新版本",
     unknown: "未知版本",
   };
@@ -2372,7 +2373,7 @@ function sourceArchiveDetailHtml(item) {
   `;
 }
 
-async function uploadSourceArchive(file, productHint, sourceVersion) {
+async function uploadSourceArchive(file, productHint, sourceVersion, versionRole = "uploaded") {
   const response = await fetch("/api/source-archives/upload", {
     method: "POST",
     credentials: "same-origin",
@@ -2381,6 +2382,7 @@ async function uploadSourceArchive(file, productHint, sourceVersion) {
       "x-source-filename": encodeURIComponent(file.name || "source.zip"),
       "x-source-product": encodeURIComponent(productHint || ""),
       "x-source-version": encodeURIComponent(sourceVersion || ""),
+      "x-source-version-role": encodeURIComponent(versionRole || "uploaded"),
     },
     body: file,
   });
@@ -2759,6 +2761,96 @@ function analysisSourcesHtml(item) {
   `;
 }
 
+function analysisEvidenceList(items, emptyText = "暂无记录") {
+  const values = Array.isArray(items) ? items.filter(Boolean) : items ? [items] : [];
+  if (!values.length) return `<div class="empty inline">${esc(emptyText)}</div>`;
+  return `
+    <ul class="detail-list compact-list">
+      ${values.slice(0, 16).map((item) => {
+        if (item && typeof item === "object") {
+          const title = item.component_name || item.component || item.title || item.name || item.summary || item.evidence || "证据";
+          const meta = [
+            item.version_range || item.version || "",
+            item.match_status || item.status || "",
+            item.match_source || "",
+            item.priority ? `优先级 ${item.priority}` : "",
+            item.confidence !== undefined ? `置信度 ${Math.round(Number(item.confidence || 0) * 100)}%` : "",
+          ].filter(Boolean).join(" · ");
+          const evidence = item.evidence || item.reason || "";
+          return `<li><span>${esc(title)}</span>${meta ? `<small>${esc(meta)}</small>` : ""}${evidence ? `<small>${esc(textPreview(evidence, 360))}</small>` : ""}</li>`;
+        }
+        return `<li><span>${esc(String(item))}</span></li>`;
+      }).join("")}
+    </ul>
+  `;
+}
+
+function analysisEvidenceChain(item) {
+  const output = analysisOutput(item);
+  const localFirst = output.local_source_first || {};
+  const impacts = item.component_impacts?.length ? item.component_impacts : (output.affected_components || []);
+  const diff = item.latest_source_diff_analysis || output.source_diff_analysis || {};
+  const diffChanges = diff.key_function_changes || diff.fix_points || [];
+  const localHitValue = localFirst.local_source_hits !== undefined
+    ? Number(localFirst.local_source_hits || 0)
+    : (item.analysis_source_found ? 1 : 0);
+  const localRows = [
+    ["模式", localFirst.mode || "enterprise_local_source_first"],
+    ["检索顺序", Array.isArray(localFirst.search_order) ? localFirst.search_order.join(" → ") : ""],
+    ["本地源码命中", localHitValue ? "是" : "否"],
+    ["依赖库命中", localFirst.dependency_hits ?? ""],
+  ].filter((row) => row[1] !== "" && row[1] !== undefined && row[1] !== null);
+  return `
+    <div class="analysis-evidence">
+      <div class="source-detail-grid">
+        ${localRows.map(([label, value]) => `<div class="kv"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}
+      </div>
+      ${localFirst.evidence ? `<p class="analysis-note">${esc(localFirst.evidence)}</p>` : ""}
+      <div class="analysis-evidence-block">
+        <h4>影响组件自动展开</h4>
+        ${analysisEvidenceList(impacts, "暂无组件命中记录；可重新分析或刷新组件影响。")}
+      </div>
+      <div class="analysis-evidence-block">
+        <h4>源码版本 Diff</h4>
+        ${diff.summary || diff.diff_summary ? `<pre>${esc(diff.summary || diff.diff_summary)}</pre>` : `<div class="empty inline">暂无 Diff 记录；上传 affected/fixed/latest 中任意两个源码后可通过后台 API 生成。</div>`}
+        ${analysisEvidenceList(diffChanges, "暂无关键函数变化记录")}
+        ${diff.bypass_risk ? `<p class="analysis-note">${esc(diff.bypass_risk)}</p>` : ""}
+      </div>
+    </div>
+  `;
+}
+
+function redTeamWorkbenchHtml(item) {
+  const output = analysisOutput(item);
+  const workbench = item.redteam_workbench || output.red_team_workbench || output.redteam_workbench || {};
+  if (!workbench || !Object.keys(workbench).length) {
+    return `<div class="empty inline">暂无红队验证工作台记录；重新分析会生成环境、版本、入口点、参数和失败原因模板。</div>`;
+  }
+  const rows = [
+    ["环境搭建提示", workbench.environment_setup],
+    ["版本确认", workbench.version_confirmation],
+    ["入口点确认", workbench.entrypoints],
+    ["请求参数分析", workbench.request_parameters],
+    ["POC 前置条件", workbench.poc_prerequisites],
+    ["利用链阶段图", workbench.exploit_chain],
+    ["失败原因记录", workbench.failure_notes],
+  ];
+  return `
+    <div class="redteam-workbench">
+      ${rows.map(([label, values]) => `
+        <div class="analysis-evidence-block">
+          <h4>${esc(label)}</h4>
+          ${analysisEvidenceList(values, "暂无记录")}
+        </div>
+      `).join("")}
+      <div class="analysis-evidence-block">
+        <h4>复现报告</h4>
+        <pre>${esc(analysisText(workbench.reproduction_report, "暂无复现报告"))}</pre>
+      </div>
+    </div>
+  `;
+}
+
 function analysisTabs(item) {
   const output = analysisOutput(item);
   const confidence = item.analysis_confidence === null || item.analysis_confidence === undefined
@@ -2783,6 +2875,8 @@ function analysisTabs(item) {
     <div class="analysis-tabs">
       <div class="analysis-tab-buttons">
         <button type="button" class="active" data-analysis-tab="summary">摘要</button>
+        <button type="button" data-analysis-tab="evidence">证据链</button>
+        <button type="button" data-analysis-tab="redteam">红队工作台</button>
         <button type="button" data-analysis-tab="poc">POC</button>
         <button type="button" data-analysis-tab="exp">EXP</button>
         <button type="button" data-analysis-tab="fix">修复建议</button>
@@ -2791,6 +2885,12 @@ function analysisTabs(item) {
       </div>
       <section data-analysis-panel="summary">
         <pre>${esc(analysisText(item.analysis_summary, "暂无分析摘要") + rootCause + attackSurface)}</pre>
+      </section>
+      <section data-analysis-panel="evidence" hidden>
+        ${analysisEvidenceChain(item)}
+      </section>
+      <section data-analysis-panel="redteam" hidden>
+        ${redTeamWorkbenchHtml(item)}
       </section>
       <section data-analysis-panel="poc" hidden>
         <div class="analysis-panel-tools">${logButton}</div>
@@ -3163,7 +3263,12 @@ $("#sourceArchiveUploadForm").addEventListener("submit", async (event) => {
   button.disabled = true;
   button.textContent = "上传中";
   try {
-    await uploadSourceArchive(file, $("#sourceArchiveProduct").value.trim(), $("#sourceArchiveVersion").value.trim());
+    await uploadSourceArchive(
+      file,
+      $("#sourceArchiveProduct").value.trim(),
+      $("#sourceArchiveVersion").value.trim(),
+      $("#sourceArchiveRole").value || "uploaded",
+    );
     $("#sourceArchiveFile").value = "";
     $("#sourceArchiveVersion").value = "";
     updateSourceArchiveFileName();
