@@ -1,6 +1,6 @@
-# Review Asset Mapping
+# ZhuWei Innovation Asset Mapping
 
-This directory is reserved for screenshots referenced by `../404-zhuwei-ai-agent-review.md`.
+This directory is reserved for screenshots referenced by `../zhuwei-innovation.md`.
 
 | File | Screenshot content |
 | --- | --- |
